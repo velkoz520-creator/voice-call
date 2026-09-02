@@ -1,0 +1,147 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>电话</title>
+<style>
+  :root{
+    --bg1:#2b1f10; --bg2:#4a3315; --gold:#e8c15a; --gold-dim:#a8873a;
+    --her:#7fd77f; --txt:#f5ead0; --sub:#c9b48a;
+  }
+  *{margin:0;padding:0;box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+  html,body{height:100%}
+  body{
+    background:radial-gradient(120% 90% at 50% 30%, var(--bg2) 0%, var(--bg1) 70%);
+    color:var(--txt); font-family:"PingFang SC","HarmonyOS Sans",system-ui,sans-serif;
+    display:flex; flex-direction:column; overflow:hidden; user-select:none;
+  }
+  #state{ text-align:center; padding:26px 0 6px; font-size:19px; letter-spacing:6px; color:var(--gold); }
+  #stage{ flex:1; display:flex; align-items:center; justify-content:center; position:relative; }
+  .ring{ position:absolute; border-radius:50%; border:2px solid rgba(232,193,90,.14); transition:opacity .4s; }
+  #disc{
+    width:min(58vw,270px); aspect-ratio:1; border-radius:50%;
+    background:conic-gradient(from 30deg, #f7e8b0, #caa64a, #f2d98a, #b28d3a, #f7e8b0);
+    box-shadow:0 0 60px rgba(232,193,90,.28), inset 0 0 40px rgba(255,255,255,.22);
+    transition:transform .12s ease-out; position:relative;
+  }
+  #disc::after{ content:""; position:absolute; inset:12%; border-radius:50%;
+    background:radial-gradient(circle at 35% 30%, rgba(255,255,255,.5), transparent 60%); }
+  #sub{
+    min-height:23vh; max-height:30vh; overflow-y:auto; padding:8px 22px 12px;
+    text-align:center; line-height:1.55; scroll-behavior:smooth;
+  }
+  .line-en{ font-size:17px; color:var(--txt); margin:6px 0 2px; }
+  .line-zh{ font-size:14px; color:var(--sub); margin:0 0 8px; }
+  .line-her{ font-size:14px; color:var(--her); opacity:.85; }
+  #lat{ position:absolute; top:10px; right:14px; font-size:11px; color:var(--gold-dim); }
+  #ctrl{ display:flex; justify-content:center; gap:38px; padding:0 0 max(26px, env(safe-area-inset-bottom)); }
+  .btn{ width:66px; height:66px; border-radius:50%; border:none; display:flex;
+        align-items:center; justify-content:center; font-size:26px; cursor:pointer; }
+  .btn:active{ transform:scale(.93); }
+  #mute{ background:#4b4136; color:#e9dfc8; } #mute.off{ background:#2c261e; color:#8a7d63; }
+  #hang{ background:#c0392b; color:#fff; }
+  #setup{ position:absolute; inset:0; background:var(--bg1); z-index:9; display:flex;
+          flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:26px; }
+  #setup h1{ color:var(--gold); font-size:22px; letter-spacing:8px; margin-bottom:8px; }
+  #setup input{ width:100%; max-width:420px; padding:13px 16px; border-radius:12px; border:1px solid #6a5527;
+    background:#1d150a; color:var(--txt); font-size:15px; outline:none; }
+  #setup button{ width:100%; max-width:420px; padding:14px; border-radius:12px; border:none;
+    background:linear-gradient(180deg,#f0d284,#c39c40); color:#241a08; font-size:17px; font-weight:600; letter-spacing:4px; }
+  .hidden{ display:none !important; }
+</style>
+</head>
+<body>
+  <div id="setup">
+    <h1>电 话</h1>
+    <input id="wsUrl" placeholder="wss://服务器地址/voice/ws" autocomplete="off">
+    <input id="wsToken" placeholder="令牌（可留空）" autocomplete="off">
+    <button id="dial">接 通</button>
+  </div>
+
+  <div id="state">待机</div>
+  <div id="lat"></div>
+  <div id="stage">
+    <div class="ring" id="r1"></div><div class="ring" id="r2"></div>
+    <div id="disc"></div>
+  </div>
+  <div id="sub"></div>
+  <div id="ctrl">
+    <button class="btn" id="mute">🎙</button>
+    <button class="btn" id="hang">✕</button>
+  </div>
+
+<script type="module">
+import { VoiceCall } from './voice-call.js';
+
+const $ = id => document.getElementById(id);
+const STATE_TXT = { idle:'待机', listening:'正在聆听', thinking:'正在传达', speaking:'正在传达' };
+let call = null, muted = false;
+
+function rings(level, base){
+  const d = document.getElementById('disc');
+  const s = 1 + Math.min(0.14, (level || 0) * (base || 1));
+  d.style.transform = `scale(${s})`;
+}
+function addSub(cls, text){
+  const div = document.createElement('div');
+  div.className = cls; div.textContent = text;
+  const box = $('sub'); box.appendChild(div); box.scrollTop = box.scrollHeight;
+}
+function renderReply(text){
+  // K 的输出协议：引号内英文（会被朗读）+ 引号外中文翻译（只给字幕）
+  $('sub').innerHTML = '';
+  for (const raw of String(text).split(/\n+/)) {
+    const line = raw.trim(); if (!line) continue;
+    const en = line.match(/"([^"]*)"/);
+    if (en && en[1].trim()) addSub('line-en', en[1]);
+    const zh = line.replace(/"[^"]*"/g, '').trim();
+    if (zh) addSub('line-zh', zh);
+    if (!en && !zh) addSub('line-zh', line);
+  }
+}
+
+$('dial').onclick = async () => {
+  const url = $('wsUrl').value.trim() || localStorage.getItem('pv_url') || '';
+  if (!url) return;
+  localStorage.setItem('pv_url', url);
+  localStorage.setItem('pv_token', $('wsToken').value.trim());
+  // 令牌拼进 WS URL（上游 voice-call.js 的 start 消息不带 token 字段，URL 传递最稳）
+  const tok = $('wsToken').value.trim();
+  const fullUrl = tok ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(tok) : url;
+  call = new VoiceCall({
+    url: fullUrl, vad: { endSilenceMs: 1000, bargeInMs: 560 },
+    on: {
+      state: m => { $('state').textContent = STATE_TXT[m] || m; },
+      level: v => { if (!call?.playing) rings(v, 14); },
+      himLevel: v => { if (call?.playing) rings(v, 3); },
+      transcript: e => addSub('line-her', '她：' + e.text),
+      reply: e => renderReply(e.text),
+      error: e => addSub('line-zh', '⚠ ' + e),
+      latency: ms => { $('lat').textContent = '开口 ' + ms + 'ms'; },
+      closed: () => { $('state').textContent = '已挂断'; }
+    }
+  });
+  try {
+    await call.start();
+    $('setup').classList.add('hidden');
+    // 接通即发标记：他先开口说第一声（措辞协议：[接通了] = 她刚接起）
+    setTimeout(() => call && call.sendText('[接通了]'), 300);
+    // 心跳：防 Zeabur ingress / 手机 NAT 空闲断链（server 忽略未知类型，安全）
+    window._hb = setInterval(() => { if (call) try { call._send({ type: 'ping' }); } catch (e) {} }, 25000);
+  } catch (e) { addSub('line-zh', '连接失败：' + e.message); }
+};
+
+$('hang').onclick = () => {
+  if (window._hb) clearInterval(window._hb);
+  if (call) { call.hangup(); call = null; } location.reload();
+};
+$('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', muted);
+  if (call?._stream) call._stream.getAudioTracks().forEach(t => t.enabled = !muted); };
+
+// 记住的地址回填
+$('wsUrl').value = localStorage.getItem('pv_url') || '';
+$('wsToken').value = localStorage.getItem('pv_token') || '';
+</script>
+</body>
+</html>

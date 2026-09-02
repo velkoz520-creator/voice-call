@@ -1,0 +1,2 @@
+aiohttp>=3.10
+websockets>=14.0
