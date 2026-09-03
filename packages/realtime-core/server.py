@@ -100,9 +100,10 @@ async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
         return str((await response.json()).get("text", "")).strip()
 
 
-async def _call_gateway(http: aiohttp.ClientSession, turn: dict) -> str:
+async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict | None = None) -> str:
     """大脑：把转录 POST 给网关语音快车道，消费 OpenAI SSE 聚合为整段回复。
-    网关侧负责：人格注入 / 通话缓存 / 意图分流 / 记忆检索。本函数只当传声筒。"""
+    网关侧负责：人格注入 / 通话缓存 / 意图分流 / 记忆检索。本函数只当传声筒。
+    metrics 非 None 时记录 gateway_first_at / gateway_done_at（分阶段指标，M1.5）。"""
     headers = {
         "authorization": f"Bearer {GATEWAY_TOKEN}",
         "content-type": "application/json",
@@ -116,6 +117,7 @@ async def _call_gateway(http: aiohttp.ClientSession, turn: dict) -> str:
         "max_tokens": 600,
     }
     parts: list[str] = []
+    first_at = None
     async with http.post(GATEWAY_URL, json=payload, headers=headers,
                          timeout=aiohttp.ClientTimeout(total=120, sock_read=90)) as response:
         if response.status != 200:
@@ -132,15 +134,22 @@ async def _call_gateway(http: aiohttp.ClientSession, turn: dict) -> str:
             except Exception:
                 continue
             if piece:
+                if first_at is None:
+                    first_at = time.time()
+                    if metrics is not None:
+                        metrics["gateway_first_at"] = first_at
                 parts.append(piece)
+    done_at = time.time()
+    if metrics is not None:
+        metrics["gateway_done_at"] = done_at
     return "".join(parts).strip()
 
 
-async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
+async def request_reply(http: aiohttp.ClientSession, turn: dict, metrics: dict | None = None) -> str:
     """路由：配置了 GATEWAY_URL 走网关快车道；否则兼容原 Adapter 协议。"""
     if GATEWAY_URL:
         async with _adapter_sem:
-            return await _call_gateway(http, turn)
+            return await _call_gateway(http, turn, metrics)
 
     if not ADAPTER_URL:
         return f"我听见了：{turn['transcript']}" if turn["transcript"] else "我没有听清楚。"
@@ -157,11 +166,14 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
 
 # 语气中间协议 → 各家 TTS 方言映射（K 在措辞里只用中间协议，方言由清洗层转译；
 # 换 TTS 厂商只改这里，措辞零改动。语法依据各官方文档，比武时逐家实测校准。）
-async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
+async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | None = None) -> bytes | None:
     """TTS：主赛道 elevenlabs；minimax 为 M1 后桩位。
-    没有 TTS provider 时仍回传文本（字幕先行）。"""
+    没有 TTS provider 时仍回传文本（字幕先行）。
+    metrics 非 None 时记录 tts_request_at / tts_first_byte_at / tts_done_at（M1.5）。"""
     if TTS_PROVIDER == "mock" or not text:
         return None
+    if metrics is not None:
+        metrics["tts_request_at"] = time.time()
     if TTS_PROVIDER == "elevenlabs":
         if not TTS_KEY or not ELEVEN_VOICE:
             raise RuntimeError("TTS provider is not configured")
@@ -174,7 +186,18 @@ async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
         async with http.post(url, headers=headers, json=body) as response:
             if response.status != 200:
                 raise RuntimeError(f"TTS request failed ({response.status})")
-            return await response.read()
+            first = True
+            chunks: list[bytes] = []
+            async for chunk in response.content.iter_chunked(16384):
+                if first and metrics is not None:
+                    metrics["tts_first_byte_at"] = time.time()
+                    first = False
+                chunks.append(chunk)
+            done = time.time()
+            if metrics is not None:
+                metrics["tts_done_at"] = done
+            audio = b"".join(chunks)
+            return audio if audio else None
     if TTS_PROVIDER == "minimax":
         raise RuntimeError("minimax TTS 桩位：M1 后接（t2a_v2，需 GROUP_ID）")
     raise RuntimeError("TTS provider is not configured")
@@ -241,6 +264,26 @@ async def drain_pending_writes(call: "Call", timeout: float = 5) -> None:
         await asyncio.gather(*pending, return_exceptions=True)
 
 
+async def log_metrics(call: "Call", turn_seq: int, turn_id: str, generation_id: int, metrics: dict) -> None:
+    """M1.5 第一步：分阶段延迟指标（纯观测，fire-and-forget）。写 Supabase voice_call_metrics + JSON 日志。"""
+    try:
+        import datetime
+        row = {
+            "call_session_id": call.id, "turn_seq": turn_seq, "turn_id": turn_id,
+            "generation_id": generation_id,
+            **{k: (datetime.datetime.fromtimestamp(v, datetime.timezone.utc).isoformat()
+                   if v else None) for k, v in metrics.items()},
+        }
+        print("[metrics] " + json.dumps(row, ensure_ascii=False), flush=True)
+        if SB_URL and SB_KEY:
+            async with aiohttp.ClientSession() as http:
+                await http.post(SB_URL.rstrip("/") + "/rest/v1/voice_call_metrics", json=row, headers={
+                    "apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Prefer": "return=minimal",
+                }, timeout=aiohttp.ClientTimeout(total=15))
+    except Exception as e:
+        print(f"[metrics] error: {e}", flush=True)
+
+
 @dataclass
 class Call:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -248,6 +291,7 @@ class Call:
     active: bool = False
     generation: int = 0
     turns: list = field(default_factory=list)          # [(role, text)] 归档用
+    turn_seq: int = 0                                  # M1.5：接收本轮时生成（与 generation_id 分开）
     pending_writes: set = field(default_factory=set)   # 后台落盘任务追踪（挂断时 drain）
     started_at: float = field(default_factory=time.time)
 
@@ -270,8 +314,13 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         await send(ws, {"type": "nothing_heard"})
         return
     turn_id = uuid.uuid4().hex
+    call.turn_seq += 1                     # M1.5：接收本轮时生成（与 generation_id 分开，不混用）
+    turn_seq = call.turn_seq
+    vad_end_at = time.time()               # 自适应停句触发点（闻序分阶段指标）
+    metrics: dict = {"vad_end_at": vad_end_at}
     try:
         transcript = supplied_text or await transcribe(http, pcm)
+        metrics["asr_done_at"] = time.time()
         if not transcript:
             await send(ws, {"type": "nothing_heard"})
             return
@@ -280,21 +329,23 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
-                                           "transcript": transcript})
+                                           "transcript": transcript}, metrics)
         if not reply:
             return
         call.turns.append(("他", reply))
         await log_turn_tracked(call, http, call.id, turn_id, "assistant", reply)  # 闻序遗漏一：重构时被删，补回
         call.generation += 1
         generation = call.generation
+        metrics["generation_id"] = generation
         spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
         await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id,
                         "text": caption})  # 闻序热修：空 caption 不回退原始 reply（防协议标签漏进字幕）
-        audio = await synthesize(http, spoken) if spoken else None
+        audio = await synthesize(http, spoken, metrics) if spoken else None
         if audio and generation == call.generation:
             await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
             await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
         await send(ws, {"type": "generation_end", "generation_id": generation})
+        await log_metrics(call, turn_seq, turn_id, generation, metrics)  # 纯观测写入，失败不影响通话
     except Exception as error:  # do not serialize credentials or provider bodies
         await send(ws, {"type": "error", "error": str(error)})
 
