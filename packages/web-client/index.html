@@ -41,6 +41,12 @@
   .btn:active{ transform:scale(.93); }
   #mute{ background:#4b4136; color:#e9dfc8; } #mute.off{ background:#2c261e; color:#8a7d63; }
   #hang{ background:#c0392b; color:#fff; }
+  #textrow{ display:flex; gap:8px; padding:0 16px 10px; }
+  #textrow input{ flex:1; max-width:520px; margin:0 auto; padding:10px 15px; border-radius:20px;
+    border:1px solid #6a5527; background:#1d150a; color:var(--txt); font-size:14px; outline:none; }
+  #textrow input::placeholder{ color:#8a7d63; }
+  #textrow button{ width:40px; height:40px; flex:none; align-self:center; border-radius:50%; border:none;
+    background:linear-gradient(180deg,#f0d284,#c39c40); color:#241a08; font-size:17px; font-weight:700; cursor:pointer; }
   #setup{ position:absolute; inset:0; background:var(--bg1); z-index:9; display:flex;
           flex-direction:column; align-items:center; justify-content:center; gap:14px; padding:26px; }
   #setup h1{ color:var(--gold); font-size:22px; letter-spacing:8px; margin-bottom:8px; }
@@ -66,6 +72,10 @@
     <div id="disc"></div>
   </div>
   <div id="sub"></div>
+  <div id="textrow" class="hidden">
+    <input id="sayText" placeholder="不想说出口的字，打给他…" autocomplete="off" enterkeyhint="send">
+    <button id="typedSend">↑</button>
+  </div>
   <div id="ctrl">
     <button class="btn" id="mute">🎙</button>
     <button class="btn" id="hang">✕</button>
@@ -127,6 +137,7 @@ $('dial').onclick = async () => {
   try {
     await call.start();
     $('setup').classList.add('hidden');
+    $('textrow').classList.remove('hidden');   // 接通后亮出打字条
     // 接通即发标记：他先开口说第一声（措辞协议：[接通了] = 她刚接起）
     setTimeout(() => call && call.sendText('[接通了]'), 300);
     // 心跳：防 Zeabur ingress / 手机 NAT 空闲断链（server 忽略未知类型，安全）
@@ -140,6 +151,17 @@ $('hang').onclick = () => {
 };
 $('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', muted);
   if (call?.stream) call.stream.getAudioTracks().forEach(t => t.enabled = !muted); };
+
+// 打字条：不想说出口的字，打给他。服务端回 transcript 回显到字幕，本地不重复显示。
+function sendTyped(){
+  const box = $('sayText');
+  const t = box.value.trim();
+  if (!t || !call) return;
+  box.value = '';
+  call.sendText(t);
+}
+$('typedSend').onclick = sendTyped;
+$('sayText').addEventListener('keydown', e => { if (e.key === 'Enter') sendTyped(); });
 
 // 记住的地址回填
 $('wsUrl').value = localStorage.getItem('pv_url') || '';

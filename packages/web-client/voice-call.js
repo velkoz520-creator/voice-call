@@ -191,9 +191,10 @@ export class VoiceCall {
     this._setMode('thinking');
   }
 
-  /** 不用麦克风也能试：直接发文字 */
+  /** 不用麦克风也能试：直接发文字。
+   *  他正在说话时不打断——播放中的音频不受影响，新回复的音频天然排在他念完之后
+   *  （排队，简单版：真实电话里也是等他说完才接话）。 */
   sendText(text) {
-    this._stopPlayback();
     this._turnSentAt = performance.now();
     this._send({ type: 'text', text });
     this._setMode('thinking');

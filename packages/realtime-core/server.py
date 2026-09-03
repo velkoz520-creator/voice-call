@@ -62,6 +62,37 @@ MAX_TURN_SECONDS = int(os.getenv("PAIVOICE_MAX_TURN_SECONDS", "60"))
 
 _adapter_sem = asyncio.Semaphore(1)  # 同一时刻只投递一轮，避免两句转录并发进网关
 
+# ASR 幻听过滤（2026-09-03）：静音/呼吸/摩擦声被 SenseVoice 脑补成单字碎片
+# （"嗯""句号"之类）。命中即整轮丢弃——她随口一声"嗯"本就不该让他接话，
+# 与闻序三级打断里"短促附和不打断"同理。只作用于语音路径，打字内容不过滤。
+ASR_HALLUCINATION_MULTI = {
+    "嗯嗯", "嗯嗯嗯", "啊啊", "句号", "逗号", "问号", "感叹号", "省略号",
+    "谢谢观看", "谢谢收看", "谢谢大家", "请不吝点赞", "订阅", "关注我们",
+    # 英文幻听词（匹配前已去空格去标点并转小写，故 here 无空格）
+    "um", "uh", "hm", "mm", "hmm", "mhm", "huh", "bye", "you",
+    "thankyou", "thanksforwatching",
+}
+MIN_SPEECH_RMS = 150  # int16 满量程 32767；低于此当环境音丢弃（比前端 VAD 门限还低，双保险）
+
+
+def _pcm_rms(pcm: bytes) -> float:
+    """整段 PCM16 的均方根音量（抽样步长 8，60s 音频也在毫秒级算完）。"""
+    import array
+    samples = array.array("h")
+    samples.frombytes(pcm[: (len(pcm) // 2) * 2])
+    if not samples:
+        return 0.0
+    picked = samples[::8]
+    return (sum(s * s for s in picked) / len(picked)) ** 0.5
+
+
+def _is_hallucination(text: str) -> bool:
+    """去标点后空串或单字碎片 → 幻听；多字短语再对黑名单核对一遍。"""
+    t = re.sub(r"[，。！？、,.!?~～…\s]", "", text or "").lower()
+    if not t or len(t) <= 1:
+        return True
+    return t in ASR_HALLUCINATION_MULTI
+
 
 def wav(pcm: bytes) -> bytes:
     buffer = io.BytesIO()
@@ -324,6 +355,11 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         if not transcript:
             await send(ws, {"type": "nothing_heard"})
             return
+        if not supplied_text:  # 打字内容不过滤；只防语音路径的幻听碎片
+            if _pcm_rms(pcm) < MIN_SPEECH_RMS or _is_hallucination(transcript):
+                print(f"[vad-filter] dropped as hallucination: {transcript!r}", flush=True)
+                await send(ws, {"type": "nothing_heard"})
+                return
         # 先存事实（内存归档缓冲 + 逐轮落盘），再通知可能已离线的前端（闻序遗漏二）
         call.turns.append(("她", transcript))
         await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)
