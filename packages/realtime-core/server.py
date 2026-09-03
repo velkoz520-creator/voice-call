@@ -258,41 +258,89 @@ async def archive_call(http: aiohttp.ClientSession, call_id: str, turns: list, d
         return False
 
 
-async def log_turn(http: aiohttp.ClientSession, call_id: str, turn_id: str, role: str, text: str) -> None:
-    """逐轮落盘（Supabase voice_call_turns）。失败仅打印不抛（M1.5 顺序队列+重试将替换本实现）。"""
-    if not (SB_URL and SB_KEY and text):
-        return
+@dataclass
+class _TurnWrite:
+    turn_seq: int
+    turn_id: str
+    role: str
+    text: str
+    attempts: int = 0
+
+
+async def _write_turn_row(http: aiohttp.ClientSession, call_id: str, item: _TurnWrite) -> bool:
+    """单条落盘（Supabase upsert）。返回 True=成功（或未配置落盘）。"""
+    if not (SB_URL and SB_KEY):
+        return True  # 未配置落盘视为已处理（本地开发/mock）
     try:
         async with http.post(SB_URL.rstrip("/") + "/rest/v1/voice_call_turns", json={
-            "call_session_id": call_id, "turn_id": turn_id, "role": role, "content": text[:4000],
+            "call_session_id": call_id, "turn_id": item.turn_id, "turn_seq": item.turn_seq,
+            "role": item.role, "content": item.text[:4000],
         }, headers={
-            "apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}", "Prefer": "return=minimal",
+            "apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}",
+            # merge-duplicates=upsert，依赖 voice_call_turns_idem_uidx（call_session_id,turn_id,role）
+            "Prefer": "return=minimal,resolution=merge-duplicates",
         }, timeout=aiohttp.ClientTimeout(total=15)) as response:
             if response.status >= 300:
-                print(f"[turn-log] write failed ({response.status})", flush=True)
+                print(f"[turn-queue] write failed ({response.status}) seq={item.turn_seq}", flush=True)
+                return False
+            return True
     except Exception as e:
-        print(f"[turn-log] error: {e}", flush=True)
+        print(f"[turn-queue] error seq={item.turn_seq}: {e}", flush=True)
+        return False
 
 
-async def log_turn_tracked(call: "Call", http: aiohttp.ClientSession, call_id: str,
-                           turn_id: str, role: str, text: str) -> None:
-    """后台落盘 + 纳入 call.pending_writes 追踪：挂断/断线时限时 drain，
-    既不阻塞字幕与 TTS，又避免后台任务活得比会话久（闻序 0 号热修）。"""
-    task = asyncio.create_task(log_turn(http, call_id, turn_id, role, text))
-    call.pending_writes.add(task)
-    task.add_done_callback(call.pending_writes.discard)
+class TurnWriter:
+    """M1.5-2 顺序持久化队列：每 Call 一个串行写 worker。
+    - 提交方 put_nowait 立即返回——DB 抖动/宕机绝不阻塞网关调用与 TTS 主流程
+    - worker 按 turn_seq 入队顺序逐条写；单条失败指数退避重试（1/2/4s，最多 4 次）后
+      放弃并留日志，后续轮次继续（读侧按 turn_seq 排序，乱序到达不破序）
+    - 幂等：DB 唯一索引 (call_session_id, turn_id, role) + merge-duplicates，重试不产生重复行
+    - close()：哨兵+限时等待排空；超时取消——不活过 ClientSession（0 号热修哲学延续）"""
+    MAX_ATTEMPTS = 4
+    RETRY_BASE_S = 1.0
 
+    def __init__(self, http: aiohttp.ClientSession, call_id: str):
+        self.http = http
+        self.call_id = call_id
+        self.q: asyncio.Queue = asyncio.Queue()
+        self.task: asyncio.Task | None = None
+        self.stopped = False
 
-async def drain_pending_writes(call: "Call", timeout: float = 5) -> None:
-    """限时等待后台落盘任务；超时的取消并收尾——保证没有任务活过 ClientSession（闻序 0 号热修闭环）。"""
-    tasks = set(call.pending_writes)
-    if not tasks:
-        return
-    _, pending = await asyncio.wait(tasks, timeout=timeout)
-    for task in pending:
-        task.cancel()
-    if pending:
-        await asyncio.gather(*pending, return_exceptions=True)
+    def submit(self, turn_seq: int, turn_id: str, role: str, text: str) -> None:
+        if self.stopped or not text:
+            return
+        if self.task is None or self.task.done():
+            self.task = asyncio.create_task(self._worker())
+        self.q.put_nowait(_TurnWrite(turn_seq, turn_id, role, text))
+
+    async def close(self, timeout: float = 8.0) -> None:
+        self.stopped = True
+        if self.task is None:
+            return
+        self.q.put_nowait(None)  # 哨兵：worker 排空队列后自然退出
+        try:
+            await asyncio.wait_for(asyncio.shield(self.task), timeout=timeout)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            self.task.cancel()
+            try:
+                await self.task
+            except BaseException:
+                pass
+
+    async def _worker(self) -> None:
+        while True:
+            item: _TurnWrite | None = await self.q.get()
+            if item is None:
+                return
+            while item.attempts < self.MAX_ATTEMPTS:
+                item.attempts += 1
+                if await _write_turn_row(self.http, self.call_id, item):
+                    break
+                if item.attempts < self.MAX_ATTEMPTS:
+                    await asyncio.sleep(self.RETRY_BASE_S * 2 ** (item.attempts - 1))
+            else:
+                print(f"[turn-queue] give up: call={self.call_id} "
+                      f"seq={item.turn_seq} role={item.role}", flush=True)
 
 
 async def log_metrics(call: "Call", turn_seq: int, turn_id: str, generation_id: int, metrics: dict) -> None:
@@ -323,7 +371,7 @@ class Call:
     generation: int = 0
     turns: list = field(default_factory=list)          # [(role, text)] 归档用
     turn_seq: int = 0                                  # M1.5：接收本轮时生成（与 generation_id 分开）
-    pending_writes: set = field(default_factory=set)   # 后台落盘任务追踪（挂断时 drain）
+    writer: "TurnWriter | None" = None                 # M1.5-2：顺序持久化队列（session() 里创建）
     started_at: float = field(default_factory=time.time)
 
     def begin_turn(self) -> None:
@@ -360,16 +408,16 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
                 print(f"[vad-filter] dropped as hallucination: {transcript!r}", flush=True)
                 await send(ws, {"type": "nothing_heard"})
                 return
-        # 先存事实（内存归档缓冲 + 逐轮落盘），再通知可能已离线的前端（闻序遗漏二）
+        # 先存事实（内存归档缓冲 + 顺序队列落盘），再通知可能已离线的前端（闻序遗漏二）
         call.turns.append(("她", transcript))
-        await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)
+        call.writer.submit(turn_seq, turn_id, "user", transcript)
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript}, metrics)
         if not reply:
             return
         call.turns.append(("他", reply))
-        await log_turn_tracked(call, http, call.id, turn_id, "assistant", reply)  # 闻序遗漏一：重构时被删，补回
+        call.writer.submit(turn_seq, turn_id, "assistant", reply)  # 闻序遗漏一：同 turn_id 不同 role，与 user 轮成对
         call.generation += 1
         generation = call.generation
         metrics["generation_id"] = generation
@@ -400,6 +448,7 @@ async def session(ws) -> None:
     end_reason = ""  # ""=异常断开 | "hangup"=正常挂断——所有出口统一走 finally
 
     async with aiohttp.ClientSession() as http:
+        call.writer = TurnWriter(http, call.id)
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
@@ -439,15 +488,15 @@ async def session(ws) -> None:
                     end_reason = "hangup"  # 清理统一走 finally，不再复制一套时序
                     return
         finally:
-            # 统一出口（在 ClientSession 关闭前）：drain 后台写库任务 → 归档。
+            # 统一出口（在 ClientSession 关闭前）：排空顺序队列 → 归档。
             # 覆盖三种离开方式：正常 hangup / keepalive 异常断开 / 处理异常——一套时序不再漂移
-            await drain_pending_writes(call, timeout=5)
+            await call.writer.close(timeout=8)
             if call.turns:
                 try:
                     ok = await archive_call(http, call.id, call.turns,
                                             int((time.time() - call.started_at) * 1000))
                     if ok:
-                        call.turns.clear()  # 归档成功才清；失败不清空——当前仅保留到会话销毁，可靠重试由 M1.5 顺序队列实现
+                        call.turns.clear()  # 归档成功才清；失败不清空——当前仅保留到会话销毁（归档重试另行实现）
                 except Exception as e:
                     print(f"[archive] error: {e}", flush=True)
 
