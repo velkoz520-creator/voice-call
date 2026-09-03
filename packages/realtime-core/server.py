@@ -524,9 +524,20 @@ async def session(ws) -> None:
                     call.begin_turn(preroll)
                     call.set_state(CallState.USER_SPEAKING)
                 elif kind == "speech_end" or kind == "text":
+                    if kind == "text":
+                        pcm = b""
+                    else:
+                        pcm = call.end_turn()
+                        # VAD 误触发防御（她的实战 bug：打字轮总被打字动静触发的空轮掐死）：
+                        # 过短/过低音量的"轮"是键盘声、手滑、环境音——不创建任务、不顶替在途轮
+                        if len(pcm) < SAMPLE_RATE * 2 * 0.3 or _pcm_rms(pcm) < MIN_SPEECH_RMS:
+                            print(f"[vad-filter] junk turn dropped "
+                                  f"({len(pcm) // 3200}0ms, rms={_pcm_rms(pcm):.0f})", flush=True)
+                            call.set_state(CallState.LISTENING)
+                            await send(ws, {"type": "state", "mode": "listening"})
+                            continue
                     # M1.5-3 核心：生成任务后台化，接收循环从此不再被 ASR/网关/TTS 阻塞——
                     # 她的打断、挂断、下一句话全部即时响应（闻序要求 100-200ms，实际毫秒级）。
-                    pcm = b"" if kind == "text" else call.end_turn()
                     if pending_generation and not pending_generation.done():
                         pending_generation.cancel()  # 新话顶旧话：被顶轮的事实已入档，生成即止
                     pending_generation = asyncio.create_task(
