@@ -386,6 +386,7 @@ class Call:
     turns: list = field(default_factory=list)          # [(role, text)] 归档用
     turn_seq: int = 0                                  # M1.5：接收本轮时生成（与 generation_id 分开）
     writer: "TurnWriter | None" = None                 # M1.5-2：顺序持久化队列（session() 里创建）
+    pending_generation: object = None                  # M1.5-3：在途生成任务（新轮确认有话时才顶替它）
     state: CallState = CallState.LISTENING             # M1.5-3：显式状态机
     started_at: float = field(default_factory=time.time)
 
@@ -419,7 +420,8 @@ async def _finish_turn(ws, call: Call) -> None:
         pass  # ws 已断：状态照常收敛，通知尽力而为
 
 
-async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, supplied_text: str = "") -> None:
+async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
+                      supplied_text: str = "", prev_generation: asyncio.Task | None = None) -> None:
     if not pcm and not supplied_text:
         await send(ws, {"type": "nothing_heard"})
         return
@@ -443,6 +445,11 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
                 await send(ws, {"type": "nothing_heard"})
                 await _finish_turn(ws, call)
                 return
+        # 顶替时机：新轮内容确认在手（ASR 非幻听/打字）才掐旧轮——
+        # 边缘音频轮、幻听轮从此没有杀人资格（她的实战教训：打字轮两度被陪葬）。
+        # prev_generation 由 session 显式传入（创建时刻的旧任务），不会误伤自己。
+        if prev_generation is not None and not prev_generation.done():
+            prev_generation.cancel()
         # 先存事实（内存归档缓冲 + 顺序队列落盘），再通知可能已离线的前端（闻序遗漏二）
         call.turns.append(("她", transcript))
         call.writer.submit(turn_seq, turn_id, "user", transcript)
@@ -528,20 +535,20 @@ async def session(ws) -> None:
                         pcm = b""
                     else:
                         pcm = call.end_turn()
-                        # VAD 误触发防御（她的实战 bug：打字轮总被打字动静触发的空轮掐死）：
-                        # 过短/过低音量的"轮"是键盘声、手滑、环境音——不创建任务、不顶替在途轮
+                        # VAD 误触发防御：过短/过低音量的"轮"不创建任务、不惊动任何人
                         if len(pcm) < SAMPLE_RATE * 2 * 0.3 or _pcm_rms(pcm) < MIN_SPEECH_RMS:
                             print(f"[vad-filter] junk turn dropped "
                                   f"({len(pcm) // 3200}0ms, rms={_pcm_rms(pcm):.0f})", flush=True)
                             call.set_state(CallState.LISTENING)
                             await send(ws, {"type": "state", "mode": "listening"})
                             continue
-                    # M1.5-3 核心：生成任务后台化，接收循环从此不再被 ASR/网关/TTS 阻塞——
-                    # 她的打断、挂断、下一句话全部即时响应（闻序要求 100-200ms，实际毫秒级）。
-                    if pending_generation and not pending_generation.done():
-                        pending_generation.cancel()  # 新话顶旧话：被顶轮的事实已入档，生成即止
+                    # M1.5-3 核心：生成任务后台化，接收循环不再被 ASR/网关/TTS 阻塞。
+                    # 顶替不在这里做——此刻还不知道新轮有没有真话，answer_turn 在内容确认后才掐旧轮。
+                    prev_task = call.pending_generation
                     pending_generation = asyncio.create_task(
-                        answer_turn(ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else ""))
+                        answer_turn(ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else "",
+                                    prev_generation=prev_task if isinstance(prev_task, asyncio.Task) else None))
+                    call.pending_generation = pending_generation  # 同步赋值，先于新任务首次调度
                 elif kind == "interrupt":
                     call.generation += 1                     # 在途音频作废（与前端 _stopPlayback 双保险）
                     if pending_generation and not pending_generation.done():
