@@ -61,6 +61,9 @@ export class VoiceCall {
     this.mode = 'idle';      // idle | listening | thinking | speaking
     this.speaking = false;   // 她在说
     this.playing = false;    // 他在说（扬声器）
+    // 预滚缓冲（M1.5-4）：VAD 确认开口要 ~200ms，确认前的音频服务端没存——
+    // 常备 ~900ms 环形缓冲，speech_start 时随消息补发，ASR 永远听到完整的她
+    this._preroll = []; this._prerollLen = 0;
     this.noise = 0.01; this._hot = 0; this._silenceSince = 0; this._hotSince = 0; this._lastHotAt = 0; this._speechMin = 1;
     this.generationId = null;
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
@@ -136,7 +139,10 @@ export class VoiceCall {
 
   // ------------------------------------------------------------ 听（Listen 轨 + VAD）
   _onCapture({ pcm, rms }) {
-    if (pcm && this.ws && this.ws.readyState === 1) this.ws.send(pcm);   // 二进制 PCM16
+    if (pcm) {
+      this._pushPreroll(pcm);                                           // 预滚缓冲常转（M1.5-4）
+      if (this.ws && this.ws.readyState === 1) this.ws.send(pcm);       // 二进制 PCM16 照常流式上传
+    }
     if (rms === undefined) return;
     this.emit('level', rms);
 
@@ -171,6 +177,27 @@ export class VoiceCall {
     if (this._lastHotAt && now - this._lastHotAt >= this.vad.watchdogMs) this._speechEnd();
   }
 
+  // ------------------------------------------------------------ 预滚（M1.5-4）
+  _pushPreroll(pcm) {
+    this._preroll.push(pcm); this._prerollLen += pcm.length;
+    const cap = 15 * 1024;                     // 15 块 × 1024 样本 @16k ≈ 960ms
+    while (this._prerollLen > cap && this._preroll.length > 1) {
+      this._prerollLen -= this._preroll[0].length;
+      this._preroll.shift();
+    }
+  }
+
+  _prerollB64() {
+    if (!this._preroll.length) return null;
+    const total = this._preroll.reduce((n, b) => n + b.length, 0);
+    const all = new Int16Array(total); let o = 0;
+    for (const b of this._preroll) { all.set(b, o); o += b.length; }
+    const bytes = new Uint8Array(all.buffer);
+    let s = '';
+    for (let i = 0; i < bytes.length; i += 0x8000) s += String.fromCharCode.apply(null, bytes.subarray(i, i + 0x8000));
+    return btoa(s);
+  }
+
   _speechStart() {
     this.speaking = true; this._speechMin = 1; this._lastHotAt = performance.now(); this._silenceSince = 0;
     this.emit('speech', true);
@@ -180,7 +207,7 @@ export class VoiceCall {
       this._stopPlayback();
       this._send({ type: 'interrupt', turn_id: 'new' });
     }
-    this._send({ type: 'speech_start', barge });
+    this._send({ type: 'speech_start', barge, preroll: this._prerollB64() });
   }
 
   _speechEnd() {

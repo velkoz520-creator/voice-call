@@ -394,9 +394,11 @@ class Call:
             print(f"[state] {self.state.value} -> {s.value}", flush=True)
             self.state = s
 
-    def begin_turn(self) -> None:
+    def begin_turn(self, preroll: bytes = b"") -> None:
+        """开始收音。preroll：客户端预滚缓冲（开口前 ~900ms 音频，M1.5-4 防吞句首），
+        截断到最近 1 秒防异常大包——ASR 对头部静音不敏感，多补无害。"""
         self.active = True
-        self.audio.clear()
+        self.audio = bytearray(preroll[-SAMPLE_RATE * 2:])
 
     def end_turn(self) -> bytes:
         self.active = False
@@ -512,7 +514,14 @@ async def session(ws) -> None:
                     token_ok = True
                     await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
                 elif kind == "speech_start":
-                    call.begin_turn()
+                    preroll = b""
+                    p64 = event.get("preroll")   # M1.5-4：客户端预滚缓冲（开口前 ~900ms），防 VAD 确认延迟吞句首
+                    if p64:
+                        try:
+                            preroll = base64.b64decode(p64)
+                        except Exception:
+                            preroll = b""
+                    call.begin_turn(preroll)
                     call.set_state(CallState.USER_SPEAKING)
                 elif kind == "speech_end" or kind == "text":
                     # M1.5-3 核心：生成任务后台化，接收循环从此不再被 ASR/网关/TTS 阻塞——
