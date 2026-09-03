@@ -21,6 +21,7 @@ import io
 import json
 import os
 import re
+from enum import Enum
 
 from cleanse import split_for_tts
 import time
@@ -366,6 +367,16 @@ async def log_metrics(call: "Call", turn_seq: int, turn_id: str, generation_id: 
         print(f"[metrics] error: {e}", flush=True)
 
 
+class CallState(str, Enum):
+    """M1.5-3：会话显式状态机（闻序蓝图八态的 M1.5 子集；RECONNECTING 等归 M2 断线续接）。
+    状态只描述"此刻谁占着话筒"，接收循环的响应速度与状态无关（生成任务已后台化）。"""
+    LISTENING = "listening"            # 通道开放，等她开口
+    USER_SPEAKING = "user_speaking"    # 她正在说（收音中）
+    K_THINKING = "k_thinking"          # 生成任务在途（ASR/网关/TTS）
+    K_SPEAKING = "k_speaking"          # 音频已下发（实际播完由前端播放队列自理）
+    ENDING = "ending"                  # 挂断/断线，收尾中
+
+
 @dataclass
 class Call:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -375,7 +386,13 @@ class Call:
     turns: list = field(default_factory=list)          # [(role, text)] 归档用
     turn_seq: int = 0                                  # M1.5：接收本轮时生成（与 generation_id 分开）
     writer: "TurnWriter | None" = None                 # M1.5-2：顺序持久化队列（session() 里创建）
+    state: CallState = CallState.LISTENING             # M1.5-3：显式状态机
     started_at: float = field(default_factory=time.time)
+
+    def set_state(self, s: CallState) -> None:
+        if s is not self.state:
+            print(f"[state] {self.state.value} -> {s.value}", flush=True)
+            self.state = s
 
     def begin_turn(self) -> None:
         self.active = True
@@ -391,6 +408,15 @@ async def send(ws, message: dict) -> None:
     await ws.send(json.dumps(message, ensure_ascii=False))
 
 
+async def _finish_turn(ws, call: Call) -> None:
+    """轮次收口：状态回 LISTENING 并通知前端——所有出口统一走，防界面卡在'正在传达'。"""
+    call.set_state(CallState.LISTENING)
+    try:
+        await send(ws, {"type": "state", "mode": "listening"})
+    except Exception:
+        pass  # ws 已断：状态照常收敛，通知尽力而为
+
+
 async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, supplied_text: str = "") -> None:
     if not pcm and not supplied_text:
         await send(ws, {"type": "nothing_heard"})
@@ -400,16 +426,20 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
     turn_seq = call.turn_seq
     vad_end_at = time.time()               # 自适应停句触发点（闻序分阶段指标）
     metrics: dict = {"vad_end_at": vad_end_at}
+    call.set_state(CallState.K_THINKING)
+    await send(ws, {"type": "state", "mode": "thinking"})
     try:
         transcript = supplied_text or await transcribe(http, pcm)
         metrics["asr_done_at"] = time.time()
         if not transcript:
             await send(ws, {"type": "nothing_heard"})
+            await _finish_turn(ws, call)
             return
         if not supplied_text:  # 打字内容不过滤；只防语音路径的幻听碎片
             if _pcm_rms(pcm) < MIN_SPEECH_RMS or _is_hallucination(transcript):
                 print(f"[vad-filter] dropped as hallucination: {transcript!r}", flush=True)
                 await send(ws, {"type": "nothing_heard"})
+                await _finish_turn(ws, call)
                 return
         # 先存事实（内存归档缓冲 + 顺序队列落盘），再通知可能已离线的前端（闻序遗漏二）
         call.turns.append(("她", transcript))
@@ -418,6 +448,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript}, metrics)
         if not reply:
+            await _finish_turn(ws, call)
             return
         call.turns.append(("他", reply))
         call.writer.submit(turn_seq, turn_id, "assistant", reply)  # 闻序遗漏一：同 turn_id 不同 role，与 user 轮成对
@@ -429,12 +460,18 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
                         "text": caption})  # 闻序热修：空 caption 不回退原始 reply（防协议标签漏进字幕）
         audio = await synthesize(http, spoken, metrics) if spoken else None
         if audio and generation == call.generation:
+            call.set_state(CallState.K_SPEAKING)   # 音频已下发（实际播完由前端自理）
             await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
             await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
         await send(ws, {"type": "generation_end", "generation_id": generation})
+        await _finish_turn(ws, call)
         await log_metrics(call, turn_seq, turn_id, generation, metrics)  # 纯观测写入，失败不影响通话
     except Exception as error:  # do not serialize credentials or provider bodies
-        await send(ws, {"type": "error", "error": str(error)})
+        await _finish_turn(ws, call)  # 收口先行（内含 ws 断保护），再尽量通知错误
+        try:
+            await send(ws, {"type": "error", "error": str(error)})
+        except Exception:
+            pass
 
 
 async def session(ws) -> None:
@@ -452,6 +489,7 @@ async def session(ws) -> None:
 
     async with aiohttp.ClientSession() as http:
         call.writer = TurnWriter(http, call.id)
+        pending_generation: asyncio.Task | None = None  # M1.5-3：在途生成任务（至多一个，新顶旧/打断/挂断均即时取消）
         try:
             async for raw in ws:
                 if isinstance(raw, bytes):
@@ -475,24 +513,34 @@ async def session(ws) -> None:
                     await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
                 elif kind == "speech_start":
                     call.begin_turn()
-                elif kind == "speech_end":
-                    pcm = call.end_turn()
-                    await send(ws, {"type": "state", "mode": "thinking"})
-                    await answer_turn(ws, call, http, pcm)
-                    await send(ws, {"type": "state", "mode": "listening"})
-                elif kind == "text":
-                    await send(ws, {"type": "state", "mode": "thinking"})
-                    await answer_turn(ws, call, http, b"", str(event.get("text", "")))
-                    await send(ws, {"type": "state", "mode": "listening"})
+                    call.set_state(CallState.USER_SPEAKING)
+                elif kind == "speech_end" or kind == "text":
+                    # M1.5-3 核心：生成任务后台化，接收循环从此不再被 ASR/网关/TTS 阻塞——
+                    # 她的打断、挂断、下一句话全部即时响应（闻序要求 100-200ms，实际毫秒级）。
+                    pcm = b"" if kind == "text" else call.end_turn()
+                    if pending_generation and not pending_generation.done():
+                        pending_generation.cancel()  # 新话顶旧话：被顶轮的事实已入档，生成即止
+                    pending_generation = asyncio.create_task(
+                        answer_turn(ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else ""))
                 elif kind == "interrupt":
-                    call.generation += 1
+                    call.generation += 1                     # 在途音频作废（与前端 _stopPlayback 双保险）
+                    if pending_generation and not pending_generation.done():
+                        pending_generation.cancel()          # 掐断网关/TTS 链路（闻序三级打断的服务端半边）
+                    call.set_state(CallState.LISTENING)
                     await send(ws, {"type": "interrupted"})
                 elif kind == "hangup":
                     end_reason = "hangup"  # 清理统一走 finally，不再复制一套时序
                     return
         finally:
-            # 统一出口（在 ClientSession 关闭前）：排空顺序队列 → 归档。
+            # 统一出口（在 ClientSession 关闭前）：收割生成任务 → 排空顺序队列 → 归档。
             # 覆盖三种离开方式：正常 hangup / keepalive 异常断开 / 处理异常——一套时序不再漂移
+            call.set_state(CallState.ENDING)
+            if pending_generation:
+                pending_generation.cancel()  # 任务可能正拿着 http——必须先收割，不允许活过 ClientSession
+                try:
+                    await asyncio.wait({pending_generation}, timeout=3)
+                except Exception:
+                    pass
             await call.writer.close(timeout=8)
             if call.turns:
                 try:
