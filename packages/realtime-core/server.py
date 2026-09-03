@@ -350,9 +350,12 @@ async def log_metrics(call: "Call", turn_seq: int, turn_id: str, generation_id: 
         row = {
             "call_session_id": call.id, "turn_seq": turn_seq, "turn_id": turn_id,
             "generation_id": generation_id,
-            **{k: (datetime.datetime.fromtimestamp(v, datetime.timezone.utc).isoformat()
-                   if v else None) for k, v in metrics.items()},
         }
+        # 只对 *_at 时间戳键做 epoch→ISO 转换；其余原样（此前无差别转换把 generation_id 转成了 1970 怪串）
+        row.update({
+            k: (datetime.datetime.fromtimestamp(v, datetime.timezone.utc).isoformat()
+                if v else None) for k, v in metrics.items() if k.endswith("_at")
+        })
         print("[metrics] " + json.dumps(row, ensure_ascii=False), flush=True)
         if SB_URL and SB_KEY:
             async with aiohttp.ClientSession() as http:
