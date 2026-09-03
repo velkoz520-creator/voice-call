@@ -90,7 +90,8 @@ function addSub(cls, text){
 }
 function renderReply(text){
   // K 的输出协议：引号内英文（会被朗读）+ 引号外中文翻译（只给字幕）
-  $('sub').innerHTML = '';
+  // 追加模式：保留历史字幕（闻序审查 P1），超限裁剪最旧行
+  while ($('sub').children.length > 60) $('sub').removeChild($('sub').firstChild);
   for (const raw of String(text).split(/\n+/)) {
     const line = raw.trim(); if (!line) continue;
     const en = line.match(/"([^"]*)"/);
@@ -137,7 +138,7 @@ $('hang').onclick = () => {
   if (call) { call.hangup(); call = null; } location.reload();
 };
 $('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', muted);
-  if (call?._stream) call._stream.getAudioTracks().forEach(t => t.enabled = !muted); };
+  if (call?.stream) call.stream.getAudioTracks().forEach(t => t.enabled = !muted); };
 
 // 记住的地址回填
 $('wsUrl').value = localStorage.getItem('pv_url') || '';

@@ -21,6 +21,8 @@ import io
 import json
 import os
 import re
+
+from cleanse import split_for_tts
 import time
 import uuid
 import wave
@@ -47,6 +49,9 @@ ELEVEN_STABILITY = os.getenv("PAIVOICE_ELEVEN_STABILITY", "")
 GATEWAY_URL = os.getenv("PAIVOICE_GATEWAY_URL", "")
 GATEWAY_TOKEN = os.getenv("PAIVOICE_GATEWAY_TOKEN", "")
 CLIENT_UA = "pai-voice/0.1 (jester-build)"
+# 兼容模式（Gateway 未配置时的原 Adapter 路线）；GATEWAY_URL 优先
+ADAPTER_URL = os.getenv("PAIVOICE_ADAPTER_URL", "")
+ADAPTER_TOKEN = os.getenv("PAIVOICE_ADAPTER_TOKEN", "")
 
 # 归档：挂断后通话全文回传网关，K 自己写摘要进记忆（C3 拍板）
 ARCHIVE_URL = os.getenv("PAIVOICE_ARCHIVE_URL", "")
@@ -152,47 +157,6 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict) -> str:
 
 # 语气中间协议 → 各家 TTS 方言映射（K 在措辞里只用中间协议，方言由清洗层转译；
 # 换 TTS 厂商只改这里，措辞零改动。语法依据各官方文档，比武时逐家实测校准。）
-_TTS_DIALECT = {
-    "elevenlabs": {
-        # ElevenLabs v3 原生支持 [laughs] [sighs] 等方括号 audio tags → 中间协议直通；
-        # (pause) 无原生停顿标签 → 用省略号+逗号近似
-        "[laughs]": "[laughs]", "[sighs]": "[sighs]", "[whispers]": "[whispers]",
-        "(pause)": "...", "(sighs)": "[sighs]", "(laughs)": "[laughs]",
-    },
-    "minimax": {
-        # MiniMax t2a_v2 原生停顿标记 <#秒#>（0.01~3s）；笑声类暂转文本，比武时校准
-        "(pause)": "<#0.6#>", "[laughs]": "哈哈", "(laughs)": "哈哈",
-        "[sighs]": "唉", "(sighs)": "唉", "[whispers]": "",
-    },
-    "mock": {},
-}
-
-
-def split_for_tts(text: str) -> tuple[str, str]:
-    """清洗层：按 K 的输出协议切分整段回复 → (tts_text, caption_text)。
-    - 引号内 = 朗读段：中间协议语气标记转译成当前厂商方言后进 TTS
-    - 引号外 = 字幕段：只做剥标记清理，进字幕不进 TTS
-    - 无引号时兜底整段进 TTS（措辞异常时宁可多读不错过）
-    - 中间协议：[laughs] [sighs] [whispers] / (pause) (laughs) (sighs)——K 只学这一套，
-      各家方言映射在 _TTS_DIALECT，换厂商措辞零改动。"""
-    dialect = _TTS_DIALECT.get(TTS_PROVIDER, {})
-    quoted = re.findall(r'"([^"]*)"', text)
-    spoken = " ".join(q.strip() for q in quoted if q.strip()) if quoted else text
-
-    # 顺序铁律：markdown 清理必须在方言转换之前（否则会吃掉 MiniMax 的 <#0.6#> 原生标记）
-    spoken = re.sub(r"[*_`#>]+", "", spoken)
-    for src, dst in dialect.items():
-        spoken = spoken.replace(src, dst)
-    if TTS_PROVIDER != "elevenlabs":  # 非直通厂商：剥掉残余的方括号标签，防被念出来
-        spoken = re.sub(r"\[[^\]\n]{1,20}\]", "", spoken)
-    spoken = spoken.strip()
-
-    caption = re.sub(r"\[[^\]\n]{1,20}\]", "", text)
-    caption = re.sub(r"\([^)\n]{1,16}\)", "", caption)
-    caption = re.sub(r"[*_`#>]{1,}", "", caption)
-    return spoken, caption
-
-
 async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
     """TTS：主赛道 elevenlabs；minimax 为 M1 后桩位。
     没有 TTS provider 时仍回传文本（字幕先行）。"""
@@ -286,18 +250,18 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             await send(ws, {"type": "nothing_heard"})
             return
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
-        asyncio.create_task(log_turn(http, call.id, turn_id, "user", transcript))
+        await log_turn(http, call.id, turn_id, "user", transcript)  # 逐轮落盘 await：进程崩溃也零丢失
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript})
         if not reply:
             return
         call.turns.append(("她", transcript))
         call.turns.append(("他", reply))
-        asyncio.create_task(log_turn(http, call.id, turn_id, "assistant", reply))
+        await log_turn(http, call.id, turn_id, "assistant", reply)
         call.generation += 1
         generation = call.generation
-        await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": reply})
-        spoken, _caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕仍显示全文
+        spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
+        await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": caption or reply})
         audio = await synthesize(http, spoken) if spoken else None
         if audio and generation == call.generation:
             await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
@@ -330,6 +294,10 @@ async def session(ws) -> None:
             except json.JSONDecodeError:
                 continue
             kind = event.get("type")
+            # 鉴权门：未通过 start 鉴权的连接只接受 start——防止匿名连接直接发
+            # text/speech_end 白烧 ASR/LLM/TTS 额度（闻序审查 P0）
+            if TOKEN and kind != "start" and not token_ok:
+                continue
             if kind == "start":
                 if TOKEN and not token_ok and event.get("token") != TOKEN:
                     await send(ws, {"type": "error", "error": "Unauthorized"})

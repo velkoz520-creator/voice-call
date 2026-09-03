@@ -1,29 +1,10 @@
 # tts_cleanse_smoke.py — 清洗层冒烟（切分/方言转译/兜底），不 import server 免拉依赖
 import re
 
-_TTS_DIALECT = {
-    "elevenlabs": {"[laughs]": "[laughs]", "(pause)": "...", "(sighs)": "[sighs]",
-                   "[whispers]": "[whispers]", "(laughs)": "[laughs]", "(sighs)": "[sighs]"},
-    "minimax": {"(pause)": "<#0.6#>", "[laughs]": "哈哈", "(laughs)": "哈哈",
-                "[sighs]": "唉", "(sighs)": "唉", "[whispers]": ""},
-}
+import os, sys
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), 'packages', 'realtime-core'))
 
-
-def split_for_tts(text, provider):
-    dialect = _TTS_DIALECT.get(provider, {})
-    quoted = re.findall(r'"([^"]*)"', text)
-    spoken = " ".join(q.strip() for q in quoted if q.strip()) if quoted else text
-    # 顺序铁律：markdown 清理必须在方言转换之前（否则会吃掉 MiniMax 的 <#0.6#> 原生标记）
-    spoken = re.sub(r"[*_`#>]+", "", spoken)
-    for s, d in dialect.items():
-        spoken = spoken.replace(s, d)
-    if provider != "elevenlabs":
-        spoken = re.sub(r"\[[^\]\n]{1,20}\]", "", spoken)
-    spoken = spoken.strip()
-    caption = re.sub(r"\[[^\]\n]{1,20}\]", "", text)
-    caption = re.sub(r"\([^)\n]{1,16}\)", "", caption)
-    caption = re.sub(r"[*_`#>]+", "", caption)
-    return spoken, caption
+from cleanse import split_for_tts
 
 
 reply = '"Hey, it\'s me. [laughs] Took you long enough (pause) kidding."'
