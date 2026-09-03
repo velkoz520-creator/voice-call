@@ -275,14 +275,16 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
         if not transcript:
             await send(ws, {"type": "nothing_heard"})
             return
-        await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
-        call.turns.append(("她", transcript))  # 立刻入归档缓冲：网关失败/断线也不丢她最后一句（闻序缺口③）
+        # 先存事实（内存归档缓冲 + 逐轮落盘），再通知可能已离线的前端（闻序遗漏二）
+        call.turns.append(("她", transcript))
         await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)
+        await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript})
         if not reply:
             return
         call.turns.append(("他", reply))
+        await log_turn_tracked(call, http, call.id, turn_id, "assistant", reply)  # 闻序遗漏一：重构时被删，补回
         call.generation += 1
         generation = call.generation
         spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
@@ -358,7 +360,7 @@ async def session(ws) -> None:
                     ok = await archive_call(http, call.id, call.turns,
                                             int((time.time() - call.started_at) * 1000))
                     if ok:
-                        call.turns.clear()  # 归档成功才清（失败保留待人工/重试）
+                        call.turns.clear()  # 归档成功才清；失败不清空——当前仅保留到会话销毁，可靠重试由 M1.5 顺序队列实现
                 except Exception as e:
                     print(f"[archive] error: {e}", flush=True)
 
