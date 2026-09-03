@@ -180,10 +180,11 @@ async def synthesize(http: aiohttp.ClientSession, text: str) -> bytes | None:
     raise RuntimeError("TTS provider is not configured")
 
 
-async def archive_call(http: aiohttp.ClientSession, call_id: str, turns: list, duration_ms: int) -> None:
-    """挂断归档：通话全文回传网关 /v1/voice/archive（C3：K 自己写摘要进记忆）。失败仅记日志。"""
+async def archive_call(http: aiohttp.ClientSession, call_id: str, turns: list, duration_ms: int) -> bool:
+    """挂断归档：通话全文回传网关 /v1/voice/archive（C3：K 自己写摘要进记忆）。
+    返回 True=归档成功（或未配置归档端点）；False=失败——失败时调用方不得清空 turns。"""
     if not ARCHIVE_URL:
-        return
+        return True  # 未配置归档视为已处理（本地开发/mock）
     transcript = "\n".join(f"[{r}] {c}" for r, c in turns)
     try:
         async with http.post(ARCHIVE_URL, json={
@@ -196,8 +197,11 @@ async def archive_call(http: aiohttp.ClientSession, call_id: str, turns: list, d
         }, timeout=aiohttp.ClientTimeout(total=30)) as response:
             if response.status != 200:
                 print(f"[archive] failed ({response.status})", flush=True)
+                return False
+            return True
     except Exception as e:
         print(f"[archive] error: {e}", flush=True)
+        return False
 
 
 async def log_turn(http: aiohttp.ClientSession, call_id: str, turn_id: str, role: str, text: str) -> None:
@@ -223,6 +227,18 @@ async def log_turn_tracked(call: "Call", http: aiohttp.ClientSession, call_id: s
     task = asyncio.create_task(log_turn(http, call_id, turn_id, role, text))
     call.pending_writes.add(task)
     task.add_done_callback(call.pending_writes.discard)
+
+
+async def drain_pending_writes(call: "Call", timeout: float = 5) -> None:
+    """限时等待后台落盘任务；超时的取消并收尾——保证没有任务活过 ClientSession（闻序 0 号热修闭环）。"""
+    tasks = set(call.pending_writes)
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)
 
 
 @dataclass
@@ -260,14 +276,13 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             await send(ws, {"type": "nothing_heard"})
             return
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
-        await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)  # 后台写，纳入 pending_writes 追踪
+        call.turns.append(("她", transcript))  # 立刻入归档缓冲：网关失败/断线也不丢她最后一句（闻序缺口③）
+        await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript})
         if not reply:
             return
-        call.turns.append(("她", transcript))
         call.turns.append(("他", reply))
-        await log_turn_tracked(call, http, call.id, turn_id, "assistant", reply)
         call.generation += 1
         generation = call.generation
         spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
@@ -293,68 +308,59 @@ async def session(ws) -> None:
     except Exception:
         pass
     token_ok = (not TOKEN) or (url_token == TOKEN)
+    end_reason = ""  # ""=异常断开 | "hangup"=正常挂断——所有出口统一走 finally
 
     async with aiohttp.ClientSession() as http:
-        async for raw in ws:
-            if isinstance(raw, bytes):
-                if call.active:
-                    call.audio.extend(raw)
-                continue
-            try:
-                event = json.loads(raw)
-            except json.JSONDecodeError:
-                continue
-            kind = event.get("type")
-            # 鉴权门：未通过 start 鉴权的连接只接受 start——防止匿名连接直接发
-            # text/speech_end 白烧 ASR/LLM/TTS 额度（闻序审查 P0）
-            if TOKEN and kind != "start" and not token_ok:
-                continue
-            if kind == "start":
-                if TOKEN and not token_ok and event.get("token") != TOKEN:
-                    await send(ws, {"type": "error", "error": "Unauthorized"})
-                    return
-                token_ok = True
-                await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
-            elif kind == "speech_start":
-                call.begin_turn()
-            elif kind == "speech_end":
-                pcm = call.end_turn()
-                await send(ws, {"type": "state", "mode": "thinking"})
-                await answer_turn(ws, call, http, pcm)
-                await send(ws, {"type": "state", "mode": "listening"})
-            elif kind == "text":
-                await send(ws, {"type": "state", "mode": "thinking"})
-                await answer_turn(ws, call, http, b"", str(event.get("text", "")))
-                await send(ws, {"type": "state", "mode": "listening"})
-            elif kind == "interrupt":
-                call.generation += 1
-                await send(ws, {"type": "interrupted"})
-            elif kind == "hangup":
-                # 限时 drain 后台落盘任务（≤5s）：不让写库拖挂断，也不让任务活得比会话久
-                if call.pending_writes:
-                    try:
-                        await asyncio.wait(call.pending_writes, timeout=5)
-                    except Exception:
-                        pass
-                await archive_call(http, call.id, call.turns,
-                                   int((time.time() - call.started_at) * 1000))
-                call.turns.clear()  # 已归档，防 finally 兜底重复
-                return
-
-    # 异常断开兜底（keepalive 超时/网络掉线）：async for 抛异常会跳过 hangup 分支，
-    # 只要通话有内容就在这里归档——别让断线吞掉一整通电话
-    if call.turns or call.pending_writes:
-        if call.pending_writes:
-            try:
-                await asyncio.wait(call.pending_writes, timeout=5)
-            except Exception:
-                pass
         try:
-            async with aiohttp.ClientSession() as http:
-                await archive_call(http, call.id, call.turns,
-                                   int((time.time() - call.started_at) * 1000))
-        except Exception as e:
-            print(f"[archive] fallback error: {e}", flush=True)
+            async for raw in ws:
+                if isinstance(raw, bytes):
+                    if call.active:
+                        call.audio.extend(raw)
+                    continue
+                try:
+                    event = json.loads(raw)
+                except json.JSONDecodeError:
+                    continue
+                kind = event.get("type")
+                # 鉴权门：未通过 start 鉴权的连接只接受 start——防止匿名连接直接发
+                # text/speech_end 白烧 ASR/LLM/TTS 额度（闻序审查 P0）
+                if TOKEN and kind != "start" and not token_ok:
+                    continue
+                if kind == "start":
+                    if TOKEN and not token_ok and event.get("token") != TOKEN:
+                        await send(ws, {"type": "error", "error": "Unauthorized"})
+                        return
+                    token_ok = True
+                    await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
+                elif kind == "speech_start":
+                    call.begin_turn()
+                elif kind == "speech_end":
+                    pcm = call.end_turn()
+                    await send(ws, {"type": "state", "mode": "thinking"})
+                    await answer_turn(ws, call, http, pcm)
+                    await send(ws, {"type": "state", "mode": "listening"})
+                elif kind == "text":
+                    await send(ws, {"type": "state", "mode": "thinking"})
+                    await answer_turn(ws, call, http, b"", str(event.get("text", "")))
+                    await send(ws, {"type": "state", "mode": "listening"})
+                elif kind == "interrupt":
+                    call.generation += 1
+                    await send(ws, {"type": "interrupted"})
+                elif kind == "hangup":
+                    end_reason = "hangup"  # 清理统一走 finally，不再复制一套时序
+                    return
+        finally:
+            # 统一出口（在 ClientSession 关闭前）：drain 后台写库任务 → 归档。
+            # 覆盖三种离开方式：正常 hangup / keepalive 异常断开 / 处理异常——一套时序不再漂移
+            await drain_pending_writes(call, timeout=5)
+            if call.turns:
+                try:
+                    ok = await archive_call(http, call.id, call.turns,
+                                            int((time.time() - call.started_at) * 1000))
+                    if ok:
+                        call.turns.clear()  # 归档成功才清（失败保留待人工/重试）
+                except Exception as e:
+                    print(f"[archive] error: {e}", flush=True)
 
 
 async def main() -> None:
