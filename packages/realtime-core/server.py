@@ -250,13 +250,15 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             await send(ws, {"type": "nothing_heard"})
             return
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
-        await log_turn(http, call.id, turn_id, "user", transcript)  # 逐轮落盘 await：进程崩溃也零丢失
+        # user 轮用 create_task：写库延迟不阻塞 LLM 请求（闻序回归①——await 会把 Supabase 最坏 15s 塞进开口链路）
+        asyncio.create_task(log_turn(http, call.id, turn_id, "user", transcript))
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript})
         if not reply:
             return
         call.turns.append(("她", transcript))
         call.turns.append(("他", reply))
+        # assistant 轮 await：回复已到手，此刻写库延迟不影响开口
         await log_turn(http, call.id, turn_id, "assistant", reply)
         call.generation += 1
         generation = call.generation
