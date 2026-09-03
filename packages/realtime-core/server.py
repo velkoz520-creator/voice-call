@@ -201,7 +201,7 @@ async def archive_call(http: aiohttp.ClientSession, call_id: str, turns: list, d
 
 
 async def log_turn(http: aiohttp.ClientSession, call_id: str, turn_id: str, role: str, text: str) -> None:
-    """逐轮实时落盘（fire-and-forget）：断线/崩溃零丢失。失败仅打印不阻塞通话。"""
+    """逐轮落盘（Supabase voice_call_turns）。失败仅打印不抛（M1.5 顺序队列+重试将替换本实现）。"""
     if not (SB_URL and SB_KEY and text):
         return
     try:
@@ -216,6 +216,15 @@ async def log_turn(http: aiohttp.ClientSession, call_id: str, turn_id: str, role
         print(f"[turn-log] error: {e}", flush=True)
 
 
+async def log_turn_tracked(call: "Call", http: aiohttp.ClientSession, call_id: str,
+                           turn_id: str, role: str, text: str) -> None:
+    """后台落盘 + 纳入 call.pending_writes 追踪：挂断/断线时限时 drain，
+    既不阻塞字幕与 TTS，又避免后台任务活得比会话久（闻序 0 号热修）。"""
+    task = asyncio.create_task(log_turn(http, call_id, turn_id, role, text))
+    call.pending_writes.add(task)
+    task.add_done_callback(call.pending_writes.discard)
+
+
 @dataclass
 class Call:
     id: str = field(default_factory=lambda: uuid.uuid4().hex)
@@ -223,6 +232,7 @@ class Call:
     active: bool = False
     generation: int = 0
     turns: list = field(default_factory=list)          # [(role, text)] 归档用
+    pending_writes: set = field(default_factory=set)   # 后台落盘任务追踪（挂断时 drain）
     started_at: float = field(default_factory=time.time)
 
     def begin_turn(self) -> None:
@@ -250,20 +260,19 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes, s
             await send(ws, {"type": "nothing_heard"})
             return
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
-        # user 轮用 create_task：写库延迟不阻塞 LLM 请求（闻序回归①——await 会把 Supabase 最坏 15s 塞进开口链路）
-        asyncio.create_task(log_turn(http, call.id, turn_id, "user", transcript))
+        await log_turn_tracked(call, http, call.id, turn_id, "user", transcript)  # 后台写，纳入 pending_writes 追踪
         reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                            "transcript": transcript})
         if not reply:
             return
         call.turns.append(("她", transcript))
         call.turns.append(("他", reply))
-        # assistant 轮 await：回复已到手，此刻写库延迟不影响开口
-        await log_turn(http, call.id, turn_id, "assistant", reply)
+        await log_turn_tracked(call, http, call.id, turn_id, "assistant", reply)
         call.generation += 1
         generation = call.generation
         spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
-        await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id, "text": caption or reply})
+        await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id,
+                        "text": caption})  # 闻序热修：空 caption 不回退原始 reply（防协议标签漏进字幕）
         audio = await synthesize(http, spoken) if spoken else None
         if audio and generation == call.generation:
             await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
@@ -321,6 +330,12 @@ async def session(ws) -> None:
                 call.generation += 1
                 await send(ws, {"type": "interrupted"})
             elif kind == "hangup":
+                # 限时 drain 后台落盘任务（≤5s）：不让写库拖挂断，也不让任务活得比会话久
+                if call.pending_writes:
+                    try:
+                        await asyncio.wait(call.pending_writes, timeout=5)
+                    except Exception:
+                        pass
                 await archive_call(http, call.id, call.turns,
                                    int((time.time() - call.started_at) * 1000))
                 call.turns.clear()  # 已归档，防 finally 兜底重复
@@ -328,7 +343,12 @@ async def session(ws) -> None:
 
     # 异常断开兜底（keepalive 超时/网络掉线）：async for 抛异常会跳过 hangup 分支，
     # 只要通话有内容就在这里归档——别让断线吞掉一整通电话
-    if call.turns:
+    if call.turns or call.pending_writes:
+        if call.pending_writes:
+            try:
+                await asyncio.wait(call.pending_writes, timeout=5)
+            except Exception:
+                pass
         try:
             async with aiohttp.ClientSession() as http:
                 await archive_call(http, call.id, call.turns,

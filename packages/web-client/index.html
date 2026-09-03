@@ -86,12 +86,13 @@ function rings(level, base){
 function addSub(cls, text){
   const div = document.createElement('div');
   div.className = cls; div.textContent = text;
-  const box = $('sub'); box.appendChild(div); box.scrollTop = box.scrollHeight;
+  const box = $('sub'); box.appendChild(div);
+  while (box.children.length > 60) box.removeChild(box.firstChild);  // 追加后裁剪
+  box.scrollTop = box.scrollHeight;
 }
 function renderReply(text){
   // K 的输出协议：引号内英文（会被朗读）+ 引号外中文翻译（只给字幕）
-  // 追加模式：保留历史字幕（闻序审查 P1），超限裁剪最旧行
-  while ($('sub').children.length > 60) $('sub').removeChild($('sub').firstChild);
+  // 追加模式：保留历史字幕（闻序审查 P1）；裁剪在追加后执行，真正不超 60 行
   for (const raw of String(text).split(/\n+/)) {
     const line = raw.trim(); if (!line) continue;
     const en = line.match(/"([^"]*)"/);
