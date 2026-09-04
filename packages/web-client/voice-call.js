@@ -48,8 +48,19 @@ export class VoiceCall {
     this.on = on;
     this.vad = Object.assign({
       startHold: 3,        // 连续几块（~20ms/块）超阈值算开口
-      endSilenceMs: 650,   // 静音多久算说完
-      bargeInMs: 560,      // 正在播放正式回复时，持续开口多久才打断（防回声/误触）
+      // 自适应停句（COVE §7 / M2）：固定阈值两难——短了思考停顿被抢断，长了短句收口拖沓。
+      // 短句说完 900ms 收口，长发言（有声累计>1.8s）给 1350ms；单句 60s 硬上限从起音算。
+      endSilenceShortMs: 900,
+      endSilenceLongMs: 1350,
+      longSpeechMs: 1800,  // 本轮有声累计超过这个 = 长发言，用长停句阈值
+      maxTurnMs: 60000,    // 单句硬上限（从起音算，不看"进入聆听"时刻）
+      // 两阶段打断（COVE §14 / M2）：扬声器回声/咳嗽/桌面碰撞不再误杀他的话——
+      // 240ms 连续人声先 duck（压低他的播放音量，留住证据），520ms 才 interrupt 真打断；
+      // 误触消失 160ms 内 restore 回原音量。预卷缓冲（M1.5-4）保证打断不吃她的句首。
+      duckMs: 240,
+      interruptMs: 520,
+      restoreMs: 160,
+      duckGain: 0.25,      // duck 时他的音量压到这个比例
       floor: 0.006,        // 最低噪声底
       gain: 3.2,           // 进入阈值 = max(floor, 噪声底 * gain)
       exitRatio: 0.62,     // 结束阈值 = 进入阈值 * 这个（双阈值，防止悬在临界卡住）
@@ -65,6 +76,8 @@ export class VoiceCall {
     // 常备 ~900ms 环形缓冲，speech_start 时随消息补发，ASR 永远听到完整的她
     this._preroll = []; this._prerollLen = 0;
     this.noise = 0.01; this._hot = 0; this._silenceSince = 0; this._hotSince = 0; this._lastHotAt = 0; this._speechMin = 1;
+    this._lastTickAt = 0; this._voicedMs = 0; this._speechStartedAt = 0;
+    this._ducked = false; this._duckSilentSince = 0;   // 两阶段 barge-in 证据
     this.generationId = null;
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
     this.video = null; this._frameTimer = null; this.canvas = null;
@@ -147,6 +160,8 @@ export class VoiceCall {
     this.emit('level', rms);
 
     const now = performance.now();
+    const dt = this._lastTickAt ? Math.min(now - this._lastTickAt, 200) : 0;  // 帧间隔（封顶防挂起后暴涨）
+    this._lastTickAt = now;
     // 噪声底：她没说话时快跟；说话中也慢慢向观测到的最小值靠（AGC 抬底噪时不至于卡死）
     if (!this.speaking) this.noise = this.noise * 0.97 + rms * 0.03;
     else { this._speechMin = Math.min(this._speechMin, rms); this.noise = Math.min(this.noise * 1.0015, Math.max(this.noise, this._speechMin)); }
@@ -161,20 +176,47 @@ export class VoiceCall {
         this._hot += 1;
         if (!this._hotSince) this._hotSince = now;
         if (this._hot >= this.vad.startHold) {
-          const needed = (this.playing && this.mode === 'speaking') ? this.vad.bargeInMs : 0;
-          if (now - this._hotSince >= needed) this._speechStart();
+          if (this.playing && this.mode === 'speaking') {
+            // 两阶段 barge-in（COVE §14）：240ms 先 duck 留证据，520ms 才真打断
+            const voiced = now - this._hotSince;
+            if (!this._ducked && voiced >= this.vad.duckMs) { this._ducked = true; this._duckTo(this.vad.duckGain); }
+            if (voiced >= this.vad.interruptMs) { this._duckTo(1); this._speechStart(); }
+          } else {
+            this._speechStart();
+          }
+        }
+      } else if (this._ducked) {
+        // 误触消失（回声/咳嗽）：160ms 内恢复他的原音量，证据清零重来
+        if (!this._duckSilentSince) this._duckSilentSince = now;
+        else if (now - this._duckSilentSince >= this.vad.restoreMs) {
+          this._ducked = false; this._duckSilentSince = 0; this._duckTo(1);
+          this._hot = 0; this._hotSince = 0;
         }
       } else { this._hot = 0; this._hotSince = 0; }
       return;
     }
-    // 说话中：低于结束阈值持续 endSilenceMs → 收尾；或者看门狗——太久没有真正的语音峰值也收尾
-    if (rms < exit) {
-      if (!this._silenceSince) this._silenceSince = now;
-      else if (now - this._silenceSince >= this.vad.endSilenceMs) { this._speechEnd(); return; }
-    } else {
+    // 说话中：自适应停句（COVE §7）——短句 900ms 快收口，长发言 1350ms 给思考停顿留白；
+    // 或者看门狗——太久没有真正的语音峰值也收尾
+    if (rms >= exit) {
+      this._voicedMs += dt;
       this._silenceSince = 0;
+    } else {
+      if (!this._silenceSince) this._silenceSince = now;
+      const need = this._voicedMs < this.vad.longSpeechMs ? this.vad.endSilenceShortMs : this.vad.endSilenceLongMs;
+      if (now - this._silenceSince >= need) { this._speechEnd(); return; }
     }
+    if (this._speechStartedAt && now - this._speechStartedAt >= this.vad.maxTurnMs) { this._speechEnd(); return; }
     if (this._lastHotAt && now - this._lastHotAt >= this.vad.watchdogMs) this._speechEnd();
+  }
+
+  /** duck/restore：只动他这一路的 outGain，她的麦克风不受影响。 */
+  _duckTo(v) {
+    if (!this.outGain || !this.ctx) return;
+    const t = this.ctx.currentTime;
+    try {
+      this.outGain.gain.cancelScheduledValues(t);
+      this.outGain.gain.setTargetAtTime(v, t, 0.04);
+    } catch { /* ignore */ }
   }
 
   // ------------------------------------------------------------ 预滚（M1.5-4）
@@ -200,6 +242,8 @@ export class VoiceCall {
 
   _speechStart() {
     this.speaking = true; this._speechMin = 1; this._lastHotAt = performance.now(); this._silenceSince = 0;
+    this._speechStartedAt = performance.now(); this._voicedMs = 0;   // 自适应停句：本轮有声累计从零起算
+    this._ducked = false; this._duckSilentSince = 0;
     this.emit('speech', true);
     // 只在听得到正式回复时打断；思考中、短提示音或误触都让他继续准备。
     const barge = this.playing && this.mode === 'speaking';
@@ -246,6 +290,8 @@ export class VoiceCall {
       case 'generation_end': this._flushSentence(msg.generation_id); this._pending.delete(msg.generation_id); break;
       case 'interrupted': this._stopPlayback(); this.emit('interrupted', msg); break;
       case 'nothing_heard': this.emit('nothingHeard', msg); break;
+      case 'hangup_soon': this.emit('hangupSoon', msg); break;    // 告别轮：他正在说再见
+      case 'do_hangup': this.emit('autoHangup', msg); break;      // 宽限期过完：服务端请我们挂断
       case 'observation': this.emit('observation', msg); break;
       case 'error': this.emit('error', msg.error); break;
       default: break;
@@ -297,7 +343,11 @@ export class VoiceCall {
       this._sources.push(src);
       src.onended = () => {
         this._sources = this._sources.filter((s) => s !== src);
-        if (!this._sources.length) { this.playing = false; this.emit('playing', false); if (this.mode === 'speaking') this._setMode('listening'); }
+        if (!this._sources.length) {
+          this.playing = false; this.emit('playing', false);
+          this._send({ type: 'playback_idle' });   // 播放排空信号：自然挂断（COVE §16）等的就是这个
+          if (this.mode === 'speaking') this._setMode('listening');
+        }
       };
       if (!this.playing) {
         this.playing = true; this.emit('playing', true);
@@ -312,6 +362,7 @@ export class VoiceCall {
     for (const s of this._sources) { try { s.onended = null; s.stop(); } catch { /* ignore */ } }
     this._sources = []; this._queue = []; this._pending.clear();
     this._playhead = 0;
+    this._duckTo(1); this._ducked = false; this._duckSilentSince = 0;   // 打断后他的音量必须回到原位
     if (this.playing) { this.playing = false; this.emit('playing', false); }
   }
 

@@ -122,7 +122,7 @@ $('dial').onclick = async () => {
   const tok = $('wsToken').value.trim();
   const fullUrl = tok ? url + (url.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(tok) : url;
   call = new VoiceCall({
-    url: fullUrl, vad: { endSilenceMs: 1000, bargeInMs: 560 },
+    url: fullUrl,   // VAD 参数用 voice-call.js 内置默认（M2：自适应停句+两阶段打断）
     on: {
       state: m => { $('state').textContent = STATE_TXT[m] || m; },
       level: v => { if (!call?.playing) rings(v, 14); },
@@ -131,6 +131,13 @@ $('dial').onclick = async () => {
       reply: e => renderReply(e.text),
       error: e => addSub('line-zh', '⚠ ' + e),
       latency: ms => { $('lat').textContent = '开口 ' + ms + 'ms'; },
+      hangupSoon: () => { $('state').textContent = '道别中…'; },
+      autoHangup: () => {   // 自然挂断（COVE §16）：他说完告别、宽限期过完，服务端请我们收线
+        if (window._hb) clearInterval(window._hb);
+        $('state').textContent = '已挂断';
+        if (call) { call.hangup(); call = null; }
+        setTimeout(() => location.reload(), 900);
+      },
       closed: () => { $('state').textContent = '已挂断'; }
     }
   });

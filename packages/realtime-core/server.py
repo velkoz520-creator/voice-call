@@ -61,6 +61,16 @@ SB_URL = os.getenv("PAIVOICE_SB_URL", "")
 SB_KEY = os.getenv("PAIVOICE_SB_KEY", "")
 MAX_TURN_SECONDS = int(os.getenv("PAIVOICE_MAX_TURN_SECONDS", "60"))
 
+# 自然挂断（COVE §16 / M2）：告别词命中 → 正常生成告别回复 → 前端播完（playback_idle）+
+# 宽限期她没再开口 → 请前端挂断收线；全程硬截止，超时强制关连接（归档统一走 finally）。
+HANGUP_GRACE_MS = int(os.getenv("PAIVOICE_HANGUP_GRACE_MS", "3500"))
+HANGUP_DEADLINE_S = float(os.getenv("PAIVOICE_HANGUP_DEADLINE_S", "30"))
+FAREWELL_RE = re.compile(
+    r"(先挂了|挂了哈|挂了吧|挂断了|那我挂|拜拜|再见|晚安|先睡了|睡了哈|先这样|去忙了|先去忙|上班去了|干活去了)")
+# 反例保护："别挂/不许挂"含"挂"字绝不能当告别。
+# 注意"不聊了/不说了"故意不收——话题转换也这么说，误挂比漏挂（她手动挂）事故得多
+FAREWELL_NEG_RE = re.compile(r"(别挂|不许挂|不准挂|不要挂|不能挂|谁挂|还没挂|没挂)")
+
 _adapter_sem = asyncio.Semaphore(1)  # 同一时刻只投递一轮，避免两句转录并发进网关
 
 # ASR 幻听过滤（2026-09-03）：静音/呼吸/摩擦声被 SenseVoice 脑补成单字碎片
@@ -389,6 +399,10 @@ class Call:
     pending_generation: object = None                  # M1.5-3：在途生成任务（新轮确认有话时才顶替它）
     state: CallState = CallState.LISTENING             # M1.5-3：显式状态机
     started_at: float = field(default_factory=time.time)
+    # 自然挂断（COVE §16 / M2）：告别轮标记 + 收线任务 + 前端播放排空时刻
+    farewell: bool = False
+    hangup_task: "asyncio.Task | None" = None
+    playback_idle_at: float = 0.0
 
     def set_state(self, s: CallState) -> None:
         if s is not self.state:
@@ -450,6 +464,8 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
         # prev_generation 由 session 显式传入（创建时刻的旧任务），不会误伤自己。
         if prev_generation is not None and not prev_generation.done():
             prev_generation.cancel()
+        # 自然挂断第一步（COVE §16）：这一轮是不是告别？反例保护优先（"别挂"含"挂"字）。
+        call.farewell = bool(FAREWELL_RE.search(transcript)) and not FAREWELL_NEG_RE.search(transcript)
         # 先存事实（内存归档缓冲 + 顺序队列落盘），再通知可能已离线的前端（闻序遗漏二）
         call.turns.append(("她", transcript))
         call.writer.submit(turn_seq, turn_id, "user", transcript)
@@ -473,6 +489,10 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
             await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
         await send(ws, {"type": "generation_end", "generation_id": generation})
+        if call.farewell:
+            # 告别回复已下发：告诉前端"道别中"，播完排空后由 graceful_hangup 收线
+            metrics["farewell"] = True
+            await send(ws, {"type": "hangup_soon", "grace_ms": HANGUP_GRACE_MS})
         await _finish_turn(ws, call)
         await log_metrics(call, turn_seq, turn_id, generation, metrics)  # 纯观测写入，失败不影响通话
     except Exception as error:  # do not serialize credentials or provider bodies
@@ -481,6 +501,35 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             await send(ws, {"type": "error", "error": str(error)})
         except Exception:
             pass
+
+
+async def graceful_hangup(ws, call: Call) -> None:
+    """自然挂断（COVE §16 / M2）：告别回复已生成下发，这里等三件事再收线——
+    ① 前端播放真正排空（playback_idle，即 TTS 队列听不见了的地面信号）
+    ② 宽限期内她没再开口（她再开口 = speech_start 分支取消本任务，告别不算数）
+    ③ 全程硬截止 HANGUP_DEADLINE_S，超时不等了直接关。
+    到点后请前端自行挂断（do_hangup），归档照旧统一走 session 的 finally——一套出口。"""
+    print(f"[farewell] graceful hangup armed (grace={HANGUP_GRACE_MS}ms, "
+          f"deadline={HANGUP_DEADLINE_S}s)", flush=True)
+    try:
+        deadline = time.time() + HANGUP_DEADLINE_S
+        while not call.playback_idle_at and time.time() < deadline:
+            await asyncio.sleep(0.2)
+        grace_end = time.time() + HANGUP_GRACE_MS / 1000
+        while time.time() < grace_end and time.time() < deadline:
+            await asyncio.sleep(0.2)
+        call.set_state(CallState.ENDING)
+        try:
+            await send(ws, {"type": "do_hangup"})
+        except Exception:
+            pass
+        await asyncio.sleep(1.5)   # 给前端留出发送 hangup/本地清理的余裕
+        try:
+            await ws.close()       # 前端没响应也强制收线；async for 退出 → finally 归档
+        except Exception:
+            pass
+    except asyncio.CancelledError:
+        raise  # 她宽限期内又开口了：告别作废，通话继续（session 里已同步复位 call.farewell）
 
 
 async def session(ws) -> None:
@@ -521,6 +570,11 @@ async def session(ws) -> None:
                     token_ok = True
                     await send(ws, {"type": "state", "call_session_id": call.id, "mode": "listening"})
                 elif kind == "speech_start":
+                    # 她又开口了：在途的自然挂断一律作废（说拜拜之后想起还有事说，太正常）
+                    if call.hangup_task and not call.hangup_task.done():
+                        call.hangup_task.cancel()
+                    call.hangup_task = None
+                    call.farewell = False
                     preroll = b""
                     p64 = event.get("preroll")   # M1.5-4：客户端预滚缓冲（开口前 ~900ms），防 VAD 确认延迟吞句首
                     if p64:
@@ -532,6 +586,11 @@ async def session(ws) -> None:
                     call.set_state(CallState.USER_SPEAKING)
                 elif kind == "speech_end" or kind == "text":
                     if kind == "text":
+                        # 打字没有 speech_start 前奏（VAD 不触发）：宽限期内她改打字说事，同样算反悔
+                        if call.hangup_task and not call.hangup_task.done():
+                            call.hangup_task.cancel()
+                        call.hangup_task = None
+                        call.farewell = False
                         pcm = b""
                     else:
                         pcm = call.end_turn()
@@ -549,7 +608,21 @@ async def session(ws) -> None:
                         answer_turn(ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else "",
                                     prev_generation=prev_task if isinstance(prev_task, asyncio.Task) else None))
                     call.pending_generation = pending_generation  # 同步赋值，先于新任务首次调度
+
+                    def _arm_farewell(task: asyncio.Task) -> None:
+                        """告别轮正常落幕后才武装收线（answer_turn 吞异常，cancelled 除外）。
+                        她中途再开口会在 speech_start 复位 farewell，回调到时自然哑火。"""
+                        if call.farewell and not task.cancelled() and (call.hangup_task is None or call.hangup_task.done()):
+                            call.playback_idle_at = 0.0  # 旧轮的排空信号作废——必须等告别回复自己播完
+                            call.hangup_task = asyncio.create_task(graceful_hangup(ws, call))
+                    pending_generation.add_done_callback(_arm_farewell)
+                elif kind == "playback_idle":
+                    call.playback_idle_at = time.time()   # 前端播放排空：自然挂断等的就是这个地面信号
                 elif kind == "interrupt":
+                    if call.hangup_task and not call.hangup_task.done():
+                        call.hangup_task.cancel()      # 打断告别轮 = 告别作废
+                    call.hangup_task = None
+                    call.farewell = False
                     call.generation += 1                     # 在途音频作废（与前端 _stopPlayback 双保险）
                     if pending_generation and not pending_generation.done():
                         pending_generation.cancel()          # 掐断网关/TTS 链路（闻序三级打断的服务端半边）
@@ -566,6 +639,12 @@ async def session(ws) -> None:
                 pending_generation.cancel()  # 任务可能正拿着 http——必须先收割，不允许活过 ClientSession
                 try:
                     await asyncio.wait({pending_generation}, timeout=3)
+                except Exception:
+                    pass
+            if call.hangup_task and not call.hangup_task.done():
+                call.hangup_task.cancel()    # 自然挂断任务拿着 ws，同理必须收割在 ClientSession 之前
+                try:
+                    await asyncio.wait({call.hangup_task}, timeout=1)
                 except Exception:
                     pass
             await call.writer.close(timeout=8)
