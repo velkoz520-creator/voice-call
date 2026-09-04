@@ -23,7 +23,7 @@ import os
 import re
 from enum import Enum
 
-from cleanse import split_for_tts
+from cleanse import split_for_tts, LineSegmenter
 import time
 import uuid
 import wave
@@ -70,6 +70,10 @@ FAREWELL_RE = re.compile(
 # 反例保护："别挂/不许挂"含"挂"字绝不能当告别。
 # 注意"不聊了/不说了"故意不收——话题转换也这么说，误挂比漏挂（她手动挂）事故得多
 FAREWELL_NEG_RE = re.compile(r"(别挂|不许挂|不准挂|不要挂|不能挂|谁挂|还没挂|没挂)")
+
+# V2 流式 TTS 总开关（B6 三保险精神）：SSE 增量→切句→逐段合成下发，首句不再等全量。
+# 出问题 env 置 0 秒回整段老路（代码保留原路径为回落）。
+STREAM_TTS = os.getenv("PAIVOICE_STREAM_TTS", "1") == "1"
 
 _adapter_sem = asyncio.Semaphore(1)  # 同一时刻只投递一轮，避免两句转录并发进网关
 
@@ -142,10 +146,13 @@ async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
         return str((await response.json()).get("text", "")).strip()
 
 
-async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict | None = None) -> str:
+async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict | None = None,
+                        on_segment=None) -> str:
     """大脑：把转录 POST 给网关语音快车道，消费 OpenAI SSE 聚合为整段回复。
     网关侧负责：人格注入 / 通话缓存 / 意图分流 / 记忆检索。本函数只当传声筒。
-    metrics 非 None 时记录 gateway_first_at / gateway_done_at（分阶段指标，M1.5）。"""
+    metrics 非 None 时记录 gateway_first_at / gateway_done_at（分阶段指标，M1.5）。
+    on_segment 非 None（V2 流式）：SSE 增量喂切句器，每切出一段就 await 回调——
+    首句不等全量（COVE §12）；返回值仍是完整整段（归档/落盘语义不变）。"""
     headers = {
         "authorization": f"Bearer {GATEWAY_TOKEN}",
         "content-type": "application/json",
@@ -160,6 +167,12 @@ async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict |
     }
     parts: list[str] = []
     first_at = None
+    segmenter = LineSegmenter() if on_segment is not None else None
+
+    async def _emit(line: str) -> None:
+        if on_segment is not None:
+            await on_segment(line)
+
     async with http.post(GATEWAY_URL, json=payload, headers=headers,
                          timeout=aiohttp.ClientTimeout(total=120, sock_read=90)) as response:
         if response.status != 200:
@@ -181,17 +194,26 @@ async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict |
                     if metrics is not None:
                         metrics["gateway_first_at"] = first_at
                 parts.append(piece)
+                if segmenter is not None:
+                    for seg in segmenter.feed(piece):
+                        await _emit(seg)
+        if segmenter is not None:
+            tail = segmenter.flush()
+            if tail:
+                await _emit(tail)
     done_at = time.time()
     if metrics is not None:
         metrics["gateway_done_at"] = done_at
     return "".join(parts).strip()
 
 
-async def request_reply(http: aiohttp.ClientSession, turn: dict, metrics: dict | None = None) -> str:
-    """路由：配置了 GATEWAY_URL 走网关快车道；否则兼容原 Adapter 协议。"""
+async def request_reply(http: aiohttp.ClientSession, turn: dict, metrics: dict | None = None,
+                        on_segment=None) -> str:
+    """路由：配置了 GATEWAY_URL 走网关快车道；否则兼容原 Adapter 协议。
+    on_segment 仅网关路径支持（V2 流式）；Adapter/兜底路径忽略之。"""
     if GATEWAY_URL:
         async with _adapter_sem:
-            return await _call_gateway(http, turn, metrics)
+            return await _call_gateway(http, turn, metrics, on_segment=on_segment)
 
     if not ADAPTER_URL:
         return f"我听见了：{turn['transcript']}" if turn["transcript"] else "我没有听清楚。"
@@ -470,24 +492,68 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
         call.turns.append(("她", transcript))
         call.writer.submit(turn_seq, turn_id, "user", transcript)
         await send(ws, {"type": "transcript", "call_session_id": call.id, "turn_id": turn_id, "text": transcript})
-        reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
-                                           "transcript": transcript}, metrics)
+        call.generation += 1
+        generation = call.generation
+        metrics["generation_id"] = generation
+
+        streamed = bool(GATEWAY_URL) and STREAM_TTS
+        if streamed:
+            # V2 流式（COVE §12）：SSE 增量 → 按行切句 → 每段立刻清洗/合成/下发。
+            # 首句 4~14 字（K 措辞协议）最先出声，不再等网关全量+整段 TTS。
+            # 代价：assistant 轮的存档从"先存后发"变为"流完再存"——SSE 期间被 cancel
+            # （打断/挂断）则该轮 reply 不入档，与 M1.5-3"被顶轮生成即止"语义一致。
+            seg_parts: list[str] = []
+            seg_first_done = False
+
+            async def _emit_segment(line: str) -> None:
+                nonlocal seg_first_done
+                seg_parts.append(line)
+                if generation != call.generation:
+                    return  # 已被顶替/打断：字幕音频都不再出（文本照攒，方便日志排查）
+                spoken, caption = split_for_tts(line)
+                if caption:
+                    await send(ws, {"type": "reply_text", "generation_id": generation,
+                                    "turn_id": turn_id, "text": caption})
+                if not spoken:
+                    return
+                seg_metrics = None
+                if not seg_first_done:   # 延迟指标只看首段（后续段不覆盖 *_at）
+                    seg_first_done = True
+                    metrics["first_segment_at"] = time.time()
+                    seg_metrics = metrics
+                try:
+                    audio = await synthesize(http, spoken, seg_metrics)
+                except Exception as e:
+                    print(f"[tts-seg] failed: {e}", flush=True)  # 单段失败跳过，后续段继续
+                    return
+                if audio and generation == call.generation:
+                    call.set_state(CallState.K_SPEAKING)
+                    await send(ws, {"type": "audio", "generation_id": generation,
+                                    "data": base64.b64encode(audio).decode("ascii")})
+                    await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
+
+            reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
+                                               "transcript": transcript}, metrics,
+                                        on_segment=_emit_segment)
+        else:
+            reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
+                                               "transcript": transcript}, metrics)
         if not reply:
             await _finish_turn(ws, call)
             return
         call.turns.append(("他", reply))
         call.writer.submit(turn_seq, turn_id, "assistant", reply)  # 闻序遗漏一：同 turn_id 不同 role，与 user 轮成对
-        call.generation += 1
-        generation = call.generation
-        metrics["generation_id"] = generation
-        spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
-        await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id,
-                        "text": caption})  # 闻序热修：空 caption 不回退原始 reply（防协议标签漏进字幕）
-        audio = await synthesize(http, spoken, metrics) if spoken else None
-        if audio and generation == call.generation:
-            call.set_state(CallState.K_SPEAKING)   # 音频已下发（实际播完由前端自理）
-            await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
-            await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
+        if not streamed:
+            spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
+            await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id,
+                            "text": caption})  # 闻序热修：空 caption 不回退原始 reply（防协议标签漏进字幕）
+            audio = await synthesize(http, spoken, metrics) if spoken else None
+            if audio and generation == call.generation:
+                call.set_state(CallState.K_SPEAKING)   # 音频已下发（实际播完由前端自理）
+                await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
+                await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
+        if streamed:
+            metrics["tts_stream_first_ok"] = seg_first_done  # 首段是否出过声（纯观测）
         await send(ws, {"type": "generation_end", "generation_id": generation})
         if call.farewell:
             # 告别回复已下发：告诉前端"道别中"，播完排空后由 graceful_hangup 收线

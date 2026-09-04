@@ -48,3 +48,32 @@ def split_for_tts(text: str, provider: str | None = None) -> tuple[str, str]:
     caption = re.sub(r"\([^)\n]{1,16}\)", "", caption)
     caption = re.sub(r"[*_`#>]+", "", caption)
     return spoken, caption
+
+
+class LineSegmenter:
+    """V2 流式 TTS 的增量切句器（COVE §12）：网关 SSE 增量喂进来，切出"可说单元"立刻回调。
+    K 的输出协议天然按行分句（一行 = "English line." 中文翻译），所以行就是切分单位；
+    无换行的长段按 max_chars 强切兜底（措辞异常时仍能流水出声，不至于憋到全量）。
+    段间顺序由消费方保证（串行下发）。"""
+
+    def __init__(self, max_chars: int = 240):
+        self.buf = ""
+        self.max_chars = max_chars
+
+    def feed(self, delta: str) -> list[str]:
+        self.buf += delta
+        segs: list[str] = []
+        while "\n" in self.buf:
+            line, self.buf = self.buf.split("\n", 1)
+            if line.strip():
+                segs.append(line.strip())
+        if len(self.buf) >= self.max_chars:      # 措辞异常兜底：无换行长段强切
+            if self.buf.strip():
+                segs.append(self.buf.strip())
+            self.buf = ""
+        return segs
+
+    def flush(self) -> str | None:
+        out = self.buf.strip()
+        self.buf = ""
+        return out or None
