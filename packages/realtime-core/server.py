@@ -52,6 +52,41 @@ ELEVEN_STABILITY = os.getenv("PAIVOICE_ELEVEN_STABILITY", "")
 LOCAL_ASR_DIR = os.getenv("PAIVOICE_LOCAL_ASR_DIR", "/app/asr-model")
 _local_recognizer = None          # 懒加载（首句才初始化，不拖启动）
 _local_recognizer_lock = __import__("threading").Lock()
+_local_decode_lock = __import__("threading").Lock()   # OfflineRecognizer 串行 decode（保守线程安全）
+
+# VAD 切段（9-05 天天转述朋友方案并拍板）：silero-vad 边说边切，段闭合即后台识别，
+# 她说完时通常只剩尾段——ASR 延迟不再随说话时长涨。模型运行时下载（2.3MB，一次）。
+ASR_CHUNK = os.getenv("PAIVOICE_ASR_CHUNK", "1") == "1"
+SILERO_VAD_MODEL_URL = os.getenv(
+    "PAIVOICE_SILERO_VAD_URL",
+    "https://github.com/snakers4/silero-vad/raw/master/src/silero_vad/data/silero_vad.onnx")
+SENSEVOICE_MODEL_URL = os.getenv(
+    "PAIVOICE_SENSEVOICE_URL",
+    "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx")
+SENSEVOICE_TOKENS_URL = os.getenv(
+    "PAIVOICE_SENSEVOICE_TOKENS_URL",
+    "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt")
+VAD_MAX_SEGMENT_S = float(os.getenv("PAIVOICE_VAD_MAX_SEGMENT_S", "25"))
+_vad_model = None                 # VadModel 单例（状态在实例上，Call 层用 reset 复用）
+_vad_model_lock = __import__("threading").Lock()
+
+
+def _ensure_model_file(path: str, url: str) -> str:
+    """模型文件缺失时运行时下载（zbpack 缓存坑的兜底：镜像没带模型也能自愈）。
+    返回路径；下载失败抛异常由调用方决定回落。"""
+    if os.path.exists(path):
+        return path
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    import requests as _requests
+    print(f"[asr-local] downloading {url} -> {path}", flush=True)
+    tmp = path + ".part"
+    with _requests.get(url, stream=True, timeout=(10, 300)) as r:
+        r.raise_for_status()
+        with open(tmp, "wb") as f:
+            for chunk in r.iter_content(chunk_size=1 << 20):
+                f.write(chunk)
+    os.replace(tmp, path)
+    return path
 
 # 大脑：网关语音快车道（OpenAI 兼容 + SSE）。UA 必须带 pai-voice，网关靠它分流。
 GATEWAY_URL = os.getenv("PAIVOICE_GATEWAY_URL", "")
@@ -128,7 +163,8 @@ def wav(pcm: bytes) -> bytes:
 
 def _get_local_recognizer():
     """懒加载容器本地 SenseVoice 识别器（sherpa-onnx + int8 ONNX，纯 CPU）。
-    双重检查锁：首句才初始化（不拖容器启动），并发轮只建一次。"""
+    双重检查锁：首句才初始化（不拖容器启动），并发轮只建一次。
+    模型文件缺失时运行时下载（一次 ~240MB，Ashburn→HF 快线）。"""
     global _local_recognizer
     if _local_recognizer is not None:
         return _local_recognizer
@@ -136,10 +172,8 @@ def _get_local_recognizer():
         if _local_recognizer is not None:
             return _local_recognizer
         import sherpa_onnx
-        model_path = os.path.join(LOCAL_ASR_DIR, "model.int8.onnx")
-        tokens_path = os.path.join(LOCAL_ASR_DIR, "tokens.txt")
-        if not os.path.exists(model_path):
-            raise RuntimeError(f"local ASR model missing: {model_path}")
+        model_path = _ensure_model_file(os.path.join(LOCAL_ASR_DIR, "model.int8.onnx"), SENSEVOICE_MODEL_URL)
+        tokens_path = _ensure_model_file(os.path.join(LOCAL_ASR_DIR, "tokens.txt"), SENSEVOICE_TOKENS_URL)
         t0 = time.time()
         recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
             model=model_path, tokens=tokens_path, use_itn=True,
@@ -151,17 +185,39 @@ def _get_local_recognizer():
         return recognizer
 
 
+def _get_vad_model():
+    """Silero VAD 单例（模型 2.3MB，缺失时运行时下载）。"""
+    global _vad_model
+    if _vad_model is not None:
+        return _vad_model
+    with _vad_model_lock:
+        if _vad_model is not None:
+            return _vad_model
+        import sherpa_onnx
+        model_path = _ensure_model_file(os.path.join(LOCAL_ASR_DIR, "silero_vad.onnx"), SILERO_VAD_MODEL_URL)
+        cfg = sherpa_onnx.VadModelConfig()
+        cfg.silero_vad.model = model_path
+        cfg.silero_vad.threshold = 0.5
+        cfg.silero_vad.min_silence_duration = 0.5
+        cfg.silero_vad.min_speech_duration = 0.25
+        cfg.sample_rate = SAMPLE_RATE
+        _vad_model = sherpa_onnx.VadModel.create(cfg)
+        print("[asr-vad] silero VAD ready", flush=True)
+        return _vad_model
+
+
 def _transcribe_local(pcm: bytes) -> str:
     """同步识别（sherpa-onnx 无原生异步）；直接吃 PCM16，连 WAV 编码都省了。
-    在 to_thread 里跑，不碰事件循环。"""
+    在 to_thread 里跑，不碰事件循环。decode 全局锁串行（保守线程安全）。"""
     import array
     recognizer = _get_local_recognizer()
     samples = array.array("h")
     samples.frombytes(pcm[: (len(pcm) // 2) * 2])
     stream = recognizer.create_stream()
     stream.accept_waveform(SAMPLE_RATE, samples.tolist())
-    recognizer.decode_stream(stream)
-    return stream.result.text.strip()
+    with _local_decode_lock:
+        recognizer.decode_stream(stream)
+        return stream.result.text.strip()
 
 
 async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
@@ -497,6 +553,12 @@ class Call:
     farewell: bool = False
     hangup_task: "asyncio.Task | None" = None
     playback_idle_at: float = 0.0
+    # VAD 切段（朋友方案）：窗口状态 + 已闭合段的后台转写任务
+    vad: object = None                  # 本通话的 VadModel（begin_turn 时 reset 复用）
+    vad_cur: list = field(default_factory=list)          # 当前段累积样本
+    vad_speech_win: int = 0             # 当前段有声样本数
+    vad_silence_win: int = 0            # 当前段尾部静音样本数
+    seg_tasks: list = field(default_factory=list)        # 在途段转写 asyncio.Task
 
     def set_state(self, s: CallState) -> None:
         if s is not self.state:
@@ -508,6 +570,20 @@ class Call:
         截断到最近 1 秒防异常大包——ASR 对头部静音不敏感，多补无害。"""
         self.active = True
         self.audio = bytearray(preroll[-SAMPLE_RATE * 2:])
+        # VAD 切段：新一轮清状态（在途段任务引用换新，旧任务自然完成结果弃用）
+        self.vad_cur = []
+        self.vad_speech_win = 0
+        self.vad_silence_win = 0
+        self.seg_tasks = []
+        if ASR_CHUNK:
+            try:
+                if self.vad is None:
+                    self.vad = _get_vad_model()
+                else:
+                    self.vad.reset()
+            except Exception as e:
+                print(f"[asr-vad] unavailable, whole-turn fallback: {e}", flush=True)
+                self.vad = None
 
     def end_turn(self) -> bytes:
         self.active = False
@@ -528,8 +604,85 @@ async def _finish_turn(ws, call: Call) -> None:
         pass  # ws 已断：状态照常收敛，通知尽力而为
 
 
+def _vad_feed(call: Call, pcm: bytes) -> None:
+    """喂 VAD 窗口；段闭合即创建后台转写任务。同步轻量（Silero ~0.001 实时率）。
+    在 WS 接收循环里跑，不阻塞收流。"""
+    if not ASR_CHUNK or call.vad is None:
+        return
+    import array
+    samples = array.array("h")
+    samples.frombytes(pcm[: (len(pcm) // 2) * 2])
+    win = call.vad.window_size()
+    min_sil = call.vad.min_silence_duration_samples()
+    min_sp = call.vad.min_speech_duration_samples()
+    max_sp = int(SAMPLE_RATE * VAD_MAX_SEGMENT_S)
+    for pos in range(0, len(samples) - win + 1, win):
+        window = samples[pos:pos + win]
+        if call.vad.is_speech(window):
+            call.vad_cur.extend(window)
+            call.vad_speech_win += win
+            call.vad_silence_win = 0
+            if call.vad_speech_win >= max_sp:          # 单段硬上限强切
+                _schedule_segment(call, call.vad_cur)
+                call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
+        else:
+            if call.vad_cur:
+                call.vad_cur.extend(window)
+                call.vad_silence_win += win
+                if call.vad_silence_win >= min_sil:    # 静音过阈：段闭合
+                    if call.vad_speech_win >= min_sp:
+                        _schedule_segment(call, call.vad_cur[:len(call.vad_cur) - call.vad_silence_win])
+                    call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
+
+
+def _schedule_segment(call: Call, samples_list: list) -> None:
+    """闭合段 → 后台转写任务（结果挂在任务上，speech_end 时统一收割拼接）。"""
+    import array
+    pcm = array.array("h", samples_list).tobytes()
+
+    async def _run() -> str:
+        try:
+            t0 = time.time()
+            text = await asyncio.to_thread(_transcribe_local, pcm)
+            print(f"[asr-vad] segment {len(pcm) // 32}ms -> {time.time() - t0:.2f}s: {text!r}", flush=True)
+            return text
+        except Exception as e:
+            print(f"[asr-vad] segment transcribe failed: {e}", flush=True)
+            return ""
+
+    call.seg_tasks.append(asyncio.create_task(_run()))
+
+
+async def _flush_vad_transcript(call: Call) -> str:
+    """speech_end 收尾：未闭合的尾段直接成段 → 等全部段转写（总超时30s）→ 拼接。
+    返回空串 = 切段无产出，调用方回落整段识别。"""
+    if not ASR_CHUNK or call.vad is None:
+        return ""
+    if call.vad_cur and call.vad_speech_win >= call.vad.min_speech_duration_samples():
+        _schedule_segment(call, call.vad_cur)
+    call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
+    tasks = list(call.seg_tasks)
+    call.seg_tasks = []
+    if not tasks:
+        return ""
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30)
+    except asyncio.TimeoutError:
+        print("[asr-vad] segment gather timeout, using partial results", flush=True)
+    texts = []
+    for t in tasks:
+        if t.done() and not t.cancelled() and not isinstance(t.result(), BaseException):
+            r = t.result()
+            if r and not _is_hallucination(r):
+                texts.append(r.strip())
+    transcript = " ".join(texts).strip()
+    print(f"[asr-vad] turn joined: {len(texts)}/{len(tasks)} segment(s), {len(transcript)} chars", flush=True)
+    return transcript
+
+
 async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
-                      supplied_text: str = "", prev_generation: asyncio.Task | None = None) -> None:
+                      supplied_text: str = "", prev_generation: asyncio.Task | None = None,
+                      vad_transcript: str = "") -> None:
     if not pcm and not supplied_text:
         await send(ws, {"type": "nothing_heard"})
         return
@@ -541,13 +694,14 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
     call.set_state(CallState.K_THINKING)
     await send(ws, {"type": "state", "mode": "thinking"})
     try:
-        transcript = supplied_text or await transcribe(http, pcm)
+        # 转写三级优先：打字 > VAD 切段拼接（段级幻听已滤） > 整段识别
+        transcript = supplied_text or vad_transcript or await transcribe(http, pcm)
         metrics["asr_done_at"] = time.time()
         if not transcript:
             await send(ws, {"type": "nothing_heard"})
             await _finish_turn(ws, call)
             return
-        if not supplied_text:  # 打字内容不过滤；只防语音路径的幻听碎片
+        if not supplied_text and not vad_transcript:  # 打字/切段路径已各自滤过，此处只防整段路径幻听
             if _pcm_rms(pcm) < MIN_SPEECH_RMS or _is_hallucination(transcript):
                 print(f"[vad-filter] dropped as hallucination: {transcript!r}", flush=True)
                 await send(ws, {"type": "nothing_heard"})
@@ -720,6 +874,7 @@ async def session(ws) -> None:
                 if isinstance(raw, bytes):
                     if call.active:
                         call.audio.extend(raw)
+                        _vad_feed(call, raw)     # VAD 切段：边说边切边识别（朋友方案）
                     continue
                 try:
                     event = json.loads(raw)
@@ -770,10 +925,12 @@ async def session(ws) -> None:
                             continue
                     # M1.5-3 核心：生成任务后台化，接收循环不再被 ASR/网关/TTS 阻塞。
                     # 顶替不在这里做——此刻还不知道新轮有没有真话，answer_turn 在内容确认后才掐旧轮。
+                    vad_transcript = await _flush_vad_transcript(call) if kind == "speech_end" else ""
                     prev_task = call.pending_generation
                     pending_generation = asyncio.create_task(
                         answer_turn(ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else "",
-                                    prev_generation=prev_task if isinstance(prev_task, asyncio.Task) else None))
+                                    prev_generation=prev_task if isinstance(prev_task, asyncio.Task) else None,
+                                    vad_transcript=vad_transcript))
                     call.pending_generation = pending_generation  # 同步赋值，先于新任务首次调度
 
                     def _arm_farewell(task: asyncio.Task) -> None:
