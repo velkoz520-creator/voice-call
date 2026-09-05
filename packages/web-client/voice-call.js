@@ -60,7 +60,8 @@ export class VoiceCall {
       duckMs: 240,
       interruptMs: 520,
       restoreMs: 160,
-      duckGain: 0.25,      // duck 时他的音量压到这个比例
+      duckGain: 0.25,      // duck 时他的音量压到基准的 25%
+      playGain: 1.5,       // 播放基准增益（9-05 天天要求原生更大声；>1 为数字放大，源音频有余量）
       floor: 0.006,        // 最低噪声底
       gain: 3.2,           // 进入阈值 = max(floor, 噪声底 * gain)
       exitRatio: 0.62,     // 结束阈值 = 进入阈值 * 这个（双阈值，防止悬在临界卡住）
@@ -100,6 +101,7 @@ export class VoiceCall {
     const workletUrl = URL.createObjectURL(blob);
     await this.ctx.audioWorklet.addModule(workletUrl);
     this.outGain = this.ctx.createGain();
+    this.outGain.gain.value = this.vad.playGain;   // 播放基准增益（9-05 天天要求原生更大声）
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 512;
     this.outGain.connect(this.analyser);
@@ -190,8 +192,8 @@ export class VoiceCall {
           if (this.playing && this.mode === 'speaking') {
             // 两阶段 barge-in（COVE §14）：240ms 先 duck 留证据，520ms 才真打断
             const voiced = now - this._hotSince;
-            if (!this._ducked && voiced >= this.vad.duckMs) { this._ducked = true; this._duckTo(this.vad.duckGain); }
-            if (voiced >= this.vad.interruptMs) { this._duckTo(1); this._speechStart(); }
+            if (!this._ducked && voiced >= this.vad.duckMs) { this._ducked = true; this._duckTo(this.vad.playGain * this.vad.duckGain); }
+            if (voiced >= this.vad.interruptMs) { this._duckTo(this.vad.playGain); this._speechStart(); }
           } else {
             this._speechStart();
           }
@@ -200,7 +202,7 @@ export class VoiceCall {
         // 误触消失（回声/咳嗽）：160ms 内恢复他的原音量，证据清零重来
         if (!this._duckSilentSince) this._duckSilentSince = now;
         else if (now - this._duckSilentSince >= this.vad.restoreMs) {
-          this._ducked = false; this._duckSilentSince = 0; this._duckTo(1);
+          this._ducked = false; this._duckSilentSince = 0; this._duckTo(this.vad.playGain);
           this._hot = 0; this._hotSince = 0;
         }
       } else { this._hot = 0; this._hotSince = 0; }
@@ -374,7 +376,7 @@ export class VoiceCall {
     for (const s of this._sources) { try { s.onended = null; s.stop(); } catch { /* ignore */ } }
     this._sources = []; this._queue = []; this._pending.clear();
     this._playhead = 0;
-    this._duckTo(1); this._ducked = false; this._duckSilentSince = 0;   // 打断后他的音量必须回到原位
+    this._duckTo(this.vad.playGain); this._ducked = false; this._duckSilentSince = 0;   // 打断后他的音量必须回到原位
     if (this.playing) { this.playing = false; this.emit('playing', false); }
   }
 

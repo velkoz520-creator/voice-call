@@ -127,8 +127,10 @@ ASR_HALLUCINATION_MULTI = {
     "嗯嗯", "嗯嗯嗯", "啊啊", "句号", "逗号", "问号", "感叹号", "省略号",
     "谢谢观看", "谢谢收看", "谢谢大家", "请不吝点赞", "订阅", "关注我们",
     # 英文幻听词（匹配前已去空格去标点并转小写，故 here 无空格）
+    # 9-05 她实测补：VAD 漏检碎片段常识别成单虚词（"the"），一并拉黑
     "um", "uh", "hm", "mm", "hmm", "mhm", "huh", "bye", "you",
     "thankyou", "thanksforwatching",
+    "the", "a", "an", "and", "to", "it", "is", "or", "so", "yeah", "ok",
 }
 MIN_SPEECH_RMS = 150  # int16 满量程 32767；低于此当环境音丢弃（比前端 VAD 门限还低，双保险）
 
@@ -198,8 +200,10 @@ def _get_vad_model():
         model_path = _ensure_model_file(os.path.join(LOCAL_ASR_DIR, "silero_vad.onnx"), SILERO_VAD_MODEL_URL)
         cfg = sherpa_onnx.VadModelConfig()
         cfg.silero_vad.model = model_path
-        cfg.silero_vad.threshold = 0.5
-        cfg.silero_vad.min_silence_duration = 0.5
+        # 9-05 她实测调参：0.5 对轻声尾音太严（"我就先修改呗"整个尾段被判静音丢弃）；
+        # 0.35 + 0.7s 闭合更保守——尾音并入段里，代价是段稍长
+        cfg.silero_vad.threshold = 0.35
+        cfg.silero_vad.min_silence_duration = 0.7
         cfg.silero_vad.min_speech_duration = 0.25
         cfg.sample_rate = SAMPLE_RATE
         _vad_model = sherpa_onnx.VadModel.create(cfg)
@@ -585,6 +589,11 @@ class Call:
             except Exception as e:
                 print(f"[asr-vad] unavailable, whole-turn fallback: {e}", flush=True)
                 self.vad = None
+                return
+            # 9-05 她实测"句首时而吞字"：预滚（开口前0.9s）必须喂给 silero，
+            # 否则起音在实时流开始前就丢了——句首补料
+            if preroll:
+                _vad_feed(self, bytes(preroll))
 
     def end_turn(self) -> bytes:
         self.active = False
@@ -659,7 +668,9 @@ async def _flush_vad_transcript(call: Call) -> str:
     返回空串 = 切段无产出，调用方回落整段识别。"""
     if not ASR_CHUNK or call.vad is None:
         return ""
-    if call.vad_cur and call.vad_speech_win >= call.vad.min_speech_duration_samples():
+    # 尾段兜底（9-05 她实测吞尾句案）：只要还有残余音频就识别一次，
+    # 生死交给幻听过滤——silero 把轻尾音判成静音时，这里就是最后一道救回的机会
+    if call.vad_cur:
         _schedule_segment(call, call.vad_cur)
     call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
     tasks = list(call.seg_tasks)
@@ -755,9 +766,10 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                 # 整段模式全文提取引号内容，翻译行天然被排除；流式按行切后翻译行会踩中
                 # split_for_tts 的"无引号兜底整行进 TTS"——中文被念出来（9-05 她实测）。
                 # 修：无引号且中文为主的行=字幕行，只进字幕不进 TTS；
-                # 无引号的非中文行（措辞异常的裸英文）保持兜底照读（宁可多读不错过）。
+                # 引号内纯中文同样跳读（K 爱引用她的原词如"不小心"，读出来是 bug
+                # 而 ElevenLabs 的英文声线念中文也不在设计内）；混合句保留朗读。
                 has_quote = bool(re.search(r'"[^"]+"', line))
-                skip_tts = (not has_quote) and _is_cjk_line(line)
+                skip_tts = ((not has_quote) and _is_cjk_line(line)) or (bool(spoken) and _is_cjk_line(spoken))
                 if caption:
                     await send(ws, {"type": "reply_text", "generation_id": generation,
                                     "turn_id": turn_id, "text": caption})
