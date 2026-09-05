@@ -83,6 +83,10 @@ export class VoiceCall {
     this.generationId = null;
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
     this._playGen = 0;   // 播放取消序号：每次 stop/hangup 递增，在途解码完成对不上即弃（闻序 9-06 P1 #11）
+    // 完成信号协议（闻序三轮 #2/#3）："三者皆空"不代表整轮结束——服务端可能还在
+    // 生成后续段。完成 = generationFinished 且解码/队列/播放源全空，去重后发 idle
+    this._genFinished = false;      // 当前 generation 是否已收到 generation_end
+    this._idleSentForGen = null;    // 已发过 playback_idle 的 generation（去重）
     this._pendingDecodes = 0;   // 在途解码计数：完成信号=无在途解码+无播放源（闻序二轮 #2）
     this.video = null; this._frameTimer = null; this.canvas = null;
     this.callSessionId = null; this.stats = { turns: 0, firstAudioMs: null };
@@ -307,11 +311,22 @@ export class VoiceCall {
       case 'transcript': this.stats.turns += 1; this.emit('transcript', msg); break;
       case 'prosody': this.emit('prosody', msg); break;
       case 'reply_text':
-        if (msg.generation_id !== this.generationId) { this.generationId = msg.generation_id; }
+        if (msg.generation_id !== this.generationId) {
+          this.generationId = msg.generation_id;
+          this._genFinished = false;          // 新一轮生成开始（闻序三轮 #2）
+          this._idleSentForGen = null;
+        }
         this.emit('reply', msg); break;
       case 'audio': this._onAudio(msg); break;
       case 'audio_sentence_end': this._flushSentence(msg.generation_id); break;
-      case 'generation_end': this._flushSentence(msg.generation_id); this._pending.delete(msg.generation_id); break;
+      case 'generation_end':
+        this._flushSentence(msg.generation_id);
+        this._pending.delete(msg.generation_id);
+        if (msg.generation_id === this.generationId) {
+          this._genFinished = true;           // 闻序三轮 #2：生成结束才具备发 idle 资格
+          this._checkPlaybackIdle();
+        }
+        break;
       case 'interrupted': this._stopPlayback(); this.emit('interrupted', msg); break;
       case 'nothing_heard': this.emit('nothingHeard', msg); break;
       case 'hangup_soon': this.emit('hangupSoon', msg); break;    // 告别轮：他正在说再见
@@ -352,10 +367,14 @@ export class VoiceCall {
     if (typeof dataOrB64 === 'string') buf = Uint8Array.from(atob(dataOrB64), (c) => c.charCodeAt(0)).buffer;
     let audio;
     try { audio = await this.ctx.decodeAudioData(buf.slice(0)); }
-    catch (e) { this._pendingDecodes--; console.warn('解码失败', e); return; }
+    catch (e) {
+      this._pendingDecodes--;
+      this._checkPlaybackIdle();           // 闻序三轮 #3：解码失败也要重判（否则卡死无 idle）
+      console.warn('解码失败', e); return;
+    }
     this._pendingDecodes--;
-    if (myGen !== this._playGen) return;   // 解码期间被打断/挂断：丢弃
-    if (!isAck && genId !== this.generationId) return;
+    if (myGen !== this._playGen) { this._checkPlaybackIdle(); return; }   // 丢弃也重判
+    if (!isAck && genId !== this.generationId) { this._checkPlaybackIdle(); return; }
     this._queue.push({ audio, genId, isAck });
     this._drain();
   }
@@ -383,12 +402,15 @@ export class VoiceCall {
     }
   }
 
-  /** 闻序二轮 #2：完成信号 = 播放源空 + 无在途解码 + 队列空——三者到齐才上报，
-   *  每次状态变化都重判（告别音频段间空隙不会误发，播完最后一刻必然触发）。 */
+  /** 闻序三轮 #2/#3：完成信号 = generation 结束 + 播放源空 + 无在途解码 + 队列空。
+   *  "扬声器在播"（playing）与"本轮输出已结束"（idle）是两个状态——纯字幕轮
+   *  从未 playing 也要发 idle；去重防重复上报。所有状态变化出口都调这里。 */
   _checkPlaybackIdle() {
+    if (!this._genFinished) return;                                   // 生成未结束：段间空隙不发
     if (this._sources.length || this._pendingDecodes > 0 || this._queue.length > 0) return;
-    if (!this.playing) return;
-    this.playing = false; this.emit('playing', false);
+    if (this.generationId == null || this._idleSentForGen === this.generationId) return;
+    this._idleSentForGen = this.generationId;
+    if (this.playing) { this.playing = false; this.emit('playing', false); }
     this._send({ type: 'playback_idle', generation_id: this.generationId });
     if (this.mode === 'speaking') this._setMode('listening');
   }

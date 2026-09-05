@@ -977,8 +977,9 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                                     "turn_id": turn_id, "text": caption})
                 if not spoken or skip_tts:
                     return
-                if time.time() < _tts_breaker["cooldown_until"]:
-                    return  # 主赛道熔断中：字幕照常，TTS 由备胎/跳过（闻序 9-06 P1：跨轮记忆）
+                # 冷却路由统一在 synthesize 内部（闻序三轮 #1：此处旧短路已删——
+                # 它在 synthesize 之前拦截，冷却期的备胎路由永远走不到，
+                # 流式第四句起只有字幕没声音）
                 seg_metrics = metrics if not seg_first_done else None
                 try:
                     audio = await synthesize(http, spoken, seg_metrics, raw_line=line)
