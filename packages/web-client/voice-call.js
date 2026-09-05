@@ -83,6 +83,7 @@ export class VoiceCall {
     this.generationId = null;
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
     this._playGen = 0;   // 播放取消序号：每次 stop/hangup 递增，在途解码完成对不上即弃（闻序 9-06 P1 #11）
+    this._pendingDecodes = 0;   // 在途解码计数：完成信号=无在途解码+无播放源（闻序二轮 #2）
     this.video = null; this._frameTimer = null; this.canvas = null;
     this.callSessionId = null; this.stats = { turns: 0, firstAudioMs: null };
     this._turnSentAt = 0;
@@ -346,10 +347,13 @@ export class VoiceCall {
 
   async _decodeAndQueue(dataOrB64, genId, isAck) {
     const myGen = this._playGen;   // 闻序 P1 #11：解码是异步的，打断后旧解码完成不得重新入队
+    this._pendingDecodes++;
     let buf = dataOrB64;
     if (typeof dataOrB64 === 'string') buf = Uint8Array.from(atob(dataOrB64), (c) => c.charCodeAt(0)).buffer;
     let audio;
-    try { audio = await this.ctx.decodeAudioData(buf.slice(0)); } catch (e) { console.warn('解码失败', e); return; }
+    try { audio = await this.ctx.decodeAudioData(buf.slice(0)); }
+    catch (e) { this._pendingDecodes--; console.warn('解码失败', e); return; }
+    this._pendingDecodes--;
     if (myGen !== this._playGen) return;   // 解码期间被打断/挂断：丢弃
     if (!isAck && genId !== this.generationId) return;
     this._queue.push({ audio, genId, isAck });
@@ -368,11 +372,7 @@ export class VoiceCall {
       this._sources.push(src);
       src.onended = () => {
         this._sources = this._sources.filter((s) => s !== src);
-        if (!this._sources.length) {
-          this.playing = false; this.emit('playing', false);
-          this._send({ type: 'playback_idle', generation_id: this.generationId });   // 闻序 P1：带 generation 防段间空隙误判
-          if (this.mode === 'speaking') this._setMode('listening');
-        }
+        if (!this._sources.length) this._checkPlaybackIdle();
       };
       if (!this.playing) {
         this.playing = true; this.emit('playing', true);
@@ -381,6 +381,16 @@ export class VoiceCall {
       }
       if (genId === this.generationId) this._setMode('speaking');
     }
+  }
+
+  /** 闻序二轮 #2：完成信号 = 播放源空 + 无在途解码 + 队列空——三者到齐才上报，
+   *  每次状态变化都重判（告别音频段间空隙不会误发，播完最后一刻必然触发）。 */
+  _checkPlaybackIdle() {
+    if (this._sources.length || this._pendingDecodes > 0 || this._queue.length > 0) return;
+    if (!this.playing) return;
+    this.playing = false; this.emit('playing', false);
+    this._send({ type: 'playback_idle', generation_id: this.generationId });
+    if (this.mode === 'speaking') this._setMode('listening');
   }
 
   _stopPlayback() {

@@ -390,6 +390,7 @@ def _minimax_ready() -> bool:
 _tts_breaker = {"fails": 0, "cooldown_until": 0.0}
 _TTS_BREAKER_THRESHOLD = 3
 _TTS_BREAKER_COOLDOWN = 90.0
+TTS_PRIMARY_TIMEOUT_S = float(os.getenv("PAIVOICE_TTS_PRIMARY_TIMEOUT_S", "30"))
 
 
 async def _synthesize_with(http: aiohttp.ClientSession, provider: str, text: str,
@@ -403,7 +404,9 @@ async def _synthesize_with(http: aiohttp.ClientSession, provider: str, text: str
             # v3 只收 stability（不支持 v2 的 similarity/style 等设置）
             body["voice_settings"] = {"stability": float(ELEVEN_STABILITY)}
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
-        async with http.post(url, headers=headers, json=body) as response:
+        # 主厂商独立超时（闻序二轮 #1：此前无预算，挂死一路拖到轮超时）
+        timeout = aiohttp.ClientTimeout(total=TTS_PRIMARY_TIMEOUT_S, sock_read=TTS_PRIMARY_TIMEOUT_S)
+        async with http.post(url, headers=headers, json=body, timeout=timeout) as response:
             if response.status != 200:
                 # 带响应体：401 风暴（9-05 她实测，持续 19 分钟后自愈）到底是 quota_exceeded
                 # 还是限流，不看 body 只能瞎猜
@@ -475,19 +478,29 @@ async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | Non
         return None
     if metrics is not None:
         metrics["tts_request_at"] = time.time()
+    provider = TTS_PROVIDER
+    # 冷却路由放这里（闻序二轮 #1：此前流式段直接 return 跳过 TTS，健康备胎被一起
+    # 静音；整段模式又不查冷却——两模式行为相反。统一：冷却中直接选备胎）
+    if provider == "elevenlabs" and time.time() < _tts_breaker["cooldown_until"] and _minimax_ready():
+        provider = "minimax"
     try:
-        return await _synthesize_with(http, TTS_PROVIDER, text, metrics, raw_line=raw_line)
+        return await _synthesize_with(http, provider, text, metrics, raw_line=raw_line)
     except Exception as primary_err:
-        _tts_breaker["fails"] += 1
-        if _tts_breaker["fails"] >= _TTS_BREAKER_THRESHOLD:
-            _tts_breaker["cooldown_until"] = time.time() + _TTS_BREAKER_COOLDOWN
-            _tts_breaker["fails"] = 0
-            print(f"[tts] primary circuit OPEN {_TTS_BREAKER_COOLDOWN}s", flush=True)
+        if provider != TTS_PROVIDER:
+            # 冷却期备胎自身失败：直接上抛（主厂商本来就在冷却，不重复计数）
+            raise
+        if provider == TTS_PROVIDER:
+            # 只统计主厂商自己的失败（备胎失败的计数无意义）
+            _tts_breaker["fails"] += 1
+            if _tts_breaker["fails"] >= _TTS_BREAKER_THRESHOLD:
+                _tts_breaker["cooldown_until"] = time.time() + _TTS_BREAKER_COOLDOWN
+                _tts_breaker["fails"] = 0
+                print(f"[tts] primary circuit OPEN {_TTS_BREAKER_COOLDOWN}s", flush=True)
         # 备胎只在主赛道是 elevenlabs 且其失败时接管；minimax 自身失败不再套娃
-        if TTS_PROVIDER == "elevenlabs" and _minimax_ready():
+        if provider == "elevenlabs" and _minimax_ready():
             print(f"[tts] primary failed, falling back to minimax: {str(primary_err)[:150]}", flush=True)
             try:
-                audio = await _synthesize_with(http, "minimax", text, None, raw_line=raw_line)
+                audio = await _synthesize_with(http, "minimax", text, metrics, raw_line=raw_line)
                 if metrics is not None:
                     metrics["tts_fallback"] = "minimax"
                 return audio
@@ -668,6 +681,7 @@ class Call:
     vad_pending: list = field(default_factory=list)      # 跨消息残余样本（凑足一个窗口再消费）
     seg_tasks: list = field(default_factory=list)        # 本轮在途段转写 asyncio.Task
     all_tasks: set = field(default_factory=set)          # 会话级全部任务追踪（闻序 9-06 P0：挂断统一收割）
+    reply_tasks: set = field(default_factory=set)        # 全部在途回复任务（闻序二轮 #5：interrupt 取消不能只取最新候选）
     closing: bool = False               # 收尾中：禁止创建新任务（闻序 9-06 P0）
     farewell_gen: int = 0               # 告别轮 generation（playback_idle 按 generation 校验）
 
@@ -825,10 +839,14 @@ async def _collect_vad(pending: dict) -> str | None:
     返回拼接转写；存在失败段 → 返回 None（调用方回落整段识别，
     不能把残缺当完整句）。"""
     tasks = pending["tasks"]
-    if pending["vad_cur"] and len(pending["vad_cur"]) >= int(SAMPLE_RATE * 0.8):
-        # 尾段兜底：残余够 0.8s 就补成段（呼吸短尾不送——幽灵 okay 闸门）
+    tail_samples = list(pending["vad_cur"]) + list(pending.get("residue") or [])
+    if tail_samples and len(tail_samples) >= int(SAMPLE_RATE * 0.8):
+        # 尾段兜底：残余够 0.8s 就补成段（呼吸短尾不送——幽灵 okay 闸门）。
+        # 闻序二轮 #3：起音上下文快照必须拼进识别料——此前漏拼，尾段丢句首；
+        # 不足窗口的跨消息残余也并入尾段（闻序二轮 #3 后半）
         import array
-        pcm = array.array("h", pending["vad_cur"]).tobytes()
+        merged = list(pending.get("seg_ctx") or []) + tail_samples
+        pcm = array.array("h", merged).tobytes()
 
         async def _tail():
             try:
@@ -914,6 +932,11 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
         call.generation += 1
         generation = call.generation
         metrics["generation_id"] = generation
+        if call.farewell:
+            # 闻序二轮 #2：初始化必须在首次下发音频之前——告别音频播得快时，
+            # playback_idle 可能先于 generation_end 到达，晚了就永远等不到第二次
+            call.playback_idle_at = 0.0
+            call.farewell_gen = generation
 
         streamed = bool(GATEWAY_URL) and STREAM_TTS
         if streamed:
@@ -962,7 +985,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                 except Exception as e:
                     print(f"[tts-seg] failed: {e}", flush=True)  # 单段失败跳过（熔断计数在 synthesize 内）
                     return
-                if not seg_first_done:   # 闻序 9-06 P2：首段时刻记"合成成功"而非"开始尝试"
+                if audio and not seg_first_done:   # 闻序二轮补：audio=None（空段）不算首次成功
                     seg_first_done = True
                     metrics["first_segment_at"] = time.time()
                 if audio and generation == call.generation:
@@ -975,14 +998,15 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                 reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                                    "transcript": transcript}, metrics,
                                             on_segment=_emit_segment)
-            except asyncio.CancelledError:
-                # 闻序 9-06 P1：已播几句后被打断，整轮 assistant 记录不能丢——
-                # 已生成部分先存档再传播取消
+            except BaseException as e:
+                # 闻序二轮 #6：打断（CancelledError）与网关异常都要存已生成部分——
+                # 只盖取消不盖异常，流中段连接错误时 assistant 落盘仍为零。
+                # 原 turn_id 保持轮次身份；"…" 后缀标识不完整
                 partial = "".join(seg_parts).strip()
                 if partial:
                     call.turns.append(("他", partial + "…"))
-                    call.writer.submit(turn_seq, turn_id + "p", "assistant", partial + "…")
-                    print(f"[stream] cancelled mid-turn, archived partial ({len(partial)} chars)", flush=True)
+                    call.writer.submit(turn_seq, turn_id, "assistant", partial + "…")
+                    print(f"[stream] mid-turn {type(e).__name__}, archived partial ({len(partial)} chars)", flush=True)
                 raise
         else:
             reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
@@ -996,7 +1020,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             spoken, caption = split_for_tts(reply)   # 引号内朗读段转译方言；字幕用清洗后文本（无协议标记）
             await send(ws, {"type": "reply_text", "generation_id": generation, "turn_id": turn_id,
                             "text": caption})  # 闻序热修：空 caption 不回退原始 reply（防协议标签漏进字幕）
-            audio = await synthesize(http, spoken, metrics) if spoken else None
+            audio = await synthesize(http, spoken, metrics, raw_line=reply) if spoken else None
             if audio and generation == call.generation:
                 call.set_state(CallState.K_SPEAKING)   # 音频已下发（实际播完由前端自理）
                 await send(ws, {"type": "audio", "generation_id": generation, "data": base64.b64encode(audio).decode("ascii")})
@@ -1005,11 +1029,8 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             metrics["tts_stream_first_ok"] = seg_first_done  # 首段是否出过声（纯观测）
         await send(ws, {"type": "generation_end", "generation_id": generation})
         if call.farewell:
-            # 告别回复已下发：告诉前端"道别中"，播完排空后由 graceful_hangup 收线。
-            # 闻序 9-06 P1：清旧排空信号必须在这里（告别 generation 明确后）而不是
-            # 武装时——否则告别音频播得快时，有效信号会被武装误清，只能干等硬截止
-            call.playback_idle_at = 0.0
-            call.farewell_gen = generation
+            # 告别回复已下发：告诉前端"道别中"（初始化已提前到音频下发前，
+            # 闻序二轮 #2），播完排空后由 graceful_hangup 收线
             metrics["farewell"] = True
             await send(ws, {"type": "hangup_soon", "grace_ms": HANGUP_GRACE_MS})
         await _finish_turn(ws, call)
@@ -1114,6 +1135,8 @@ async def session(ws) -> None:
                         call.hangup_task = None
                         call.farewell = False
                         pcm = b""
+                        # 闻序二轮 #4：文字轮不碰 VAD 语音分段状态——
+                        # 她语音说到一半改打字，已切的段留给下一个 speech_end 收割
                     else:
                         pcm = call.end_turn()
                         # VAD 误触发防御：过短/过低音量的"轮"不创建任务、不惊动任何人
@@ -1127,10 +1150,13 @@ async def session(ws) -> None:
                     vad_end_at = time.time()
                     # 同步封存本轮 VAD 段状态（闻序 9-06 P0：接收循环绝不 await 收割——
                     # 期间 interrupt/hangup/新语音全堵。收割挪进 answer_turn 后台任务）
-                    vad_pending = {"tasks": call.seg_tasks[:],
-                                   "vad_cur": call.vad_cur[:],
-                                   "seg_ctx": call.vad_seg_ctx[:]} if kind == "speech_end" else None
-                    call.seg_tasks, call.vad_cur, call.vad_seg_ctx = [], [], []
+                    vad_pending = None
+                    if kind == "speech_end":
+                        vad_pending = {"tasks": call.seg_tasks[:],
+                                       "vad_cur": call.vad_cur[:],
+                                       "seg_ctx": call.vad_seg_ctx[:],
+                                       "residue": call.vad_pending[:]}   # 不足窗口的跨消息残余（闻序二轮 #3）
+                        call.seg_tasks, call.vad_cur, call.vad_seg_ctx, call.vad_pending = [], [], [], []
                     # M1.5-3 核心：生成任务后台化，接收循环不再被 ASR/网关/TTS 阻塞。
                     # 顶替不在这里做——此刻还不知道新轮有没有真话，answer_turn 在内容确认后才掐旧轮。
                     prev_task = call.pending_generation
@@ -1141,6 +1167,11 @@ async def session(ws) -> None:
                     if pending_generation is None:   # closing 中：不应发生，防御
                         continue
                     call.pending_generation = pending_generation  # 同步赋值，先于新任务首次调度
+                    call.reply_tasks.add(pending_generation)
+
+                    def _reply_done(t):
+                        call.reply_tasks.discard(t)
+                    pending_generation.add_done_callback(_reply_done)
 
                     def _arm_farewell(task: asyncio.Task) -> None:
                         """告别轮正常落幕后才武装收线（answer_turn 吞异常，cancelled 除外）。
@@ -1159,7 +1190,13 @@ async def session(ws) -> None:
                         call.hangup_task.cancel()      # 打断告别轮 = 告别作废
                     call.hangup_task = None
                     call.farewell = False
+                    call.farewell_gen = 0
                     call.generation += 1                     # 在途音频作废（与前端 _stopPlayback 双保险）
+                    # 闻序二轮 #5：打断要取消全部在途回复任务——"最新候选"可能是
+                    # 空轮已结束的 B，真正在跑的 A 若只看 pending_generation 会漏
+                    for t in list(call.reply_tasks):
+                        if not t.done():
+                            t.cancel()
                     if pending_generation and not pending_generation.done():
                         pending_generation.cancel()          # 掐断网关/TTS 链路（闻序三级打断的服务端半边）
                     call.set_state(CallState.LISTENING)
