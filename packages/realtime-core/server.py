@@ -505,16 +505,34 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             seg_parts: list[str] = []
             seg_first_done = False
 
+            def _is_cjk_line(text: str) -> bool:
+                """去标点空白后含中文且非点缀（CJK≥2 字且占比≥1/3）→ 中文行。
+                阈值放这么宽是故意的：翻译行常夹英文单词（'你居然 ping 我？' CJK 恰好
+                过不了过半线），而漏判的成本是把中文念出来（她实测的 bug），误判的
+                成本只是少读一行该静默的字幕。"""
+                s = re.sub(r"[\s，。！？、,.!?~～…\-—'\"“”()\[\]：:；;]", "", text)
+                if not s:
+                    return False
+                cjk = sum(1 for ch in s if "\u4e00" <= ch <= "\u9fff")
+                return cjk >= 2 and cjk * 3 >= len(s)
+
             async def _emit_segment(line: str) -> None:
                 nonlocal seg_first_done
                 seg_parts.append(line)
                 if generation != call.generation:
                     return  # 已被顶替/打断：字幕音频都不再出（文本照攒，方便日志排查）
                 spoken, caption = split_for_tts(line)
+                # 双语协议（K 措辞）：英文朗读一行（带引号），中文翻译另起一行/多行（无引号）。
+                # 整段模式全文提取引号内容，翻译行天然被排除；流式按行切后翻译行会踩中
+                # split_for_tts 的"无引号兜底整行进 TTS"——中文被念出来（9-05 她实测）。
+                # 修：无引号且中文为主的行=字幕行，只进字幕不进 TTS；
+                # 无引号的非中文行（措辞异常的裸英文）保持兜底照读（宁可多读不错过）。
+                has_quote = bool(re.search(r'"[^"]+"', line))
+                skip_tts = (not has_quote) and _is_cjk_line(line)
                 if caption:
                     await send(ws, {"type": "reply_text", "generation_id": generation,
                                     "turn_id": turn_id, "text": caption})
-                if not spoken:
+                if not spoken or skip_tts:
                     return
                 seg_metrics = None
                 if not seg_first_done:   # 延迟指标只看首段（后续段不覆盖 *_at）
