@@ -12,7 +12,7 @@ COPY packages/web-client/voice-call.js ./voice-call.js
 ENV PAIVOICE_LOCAL_ASR_DIR=/app/asr-model
 RUN mkdir -p /app/asr-model     && curl -fsSL --retry 3 -o /app/asr-model/model.int8.onnx        "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/model.int8.onnx"     && curl -fsSL --retry 3 -o /app/asr-model/tokens.txt        "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt"
 # build marker: 强制后续层缓存失效（89b225f+ = 幻听过滤+打字条版）
-RUN echo "build-ref: 89b225f-hallucination-filter-textbar" > /app/.build_ref
+RUN echo "build-ref: 92b1f4e-local-asr-sensevoice" > /app/.build_ref
 ENV PAIVOICE_HOST=0.0.0.0
 EXPOSE 8780
 CMD ["python", "server.py"]
