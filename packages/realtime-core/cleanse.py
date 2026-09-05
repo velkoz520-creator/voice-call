@@ -50,6 +50,66 @@ def split_for_tts(text: str, provider: str | None = None) -> tuple[str, str]:
     return spoken, caption
 
 
+class ThinkFilter:
+    """流式剥离 <think>...</think> 推理块（9-05 她实测案：thinking 渠道把内心独白
+    混进 content 流，被切句朗读）。字符级状态机，标签跨 chunk 断开也安全：
+    尾部保留可能是半截标签的字符，直到能判定是标签还是普通文本。
+    用在 LineSegmenter 之前——字幕、TTS、归档三处一起干净。"""
+
+    OPEN = "<think>"
+    CLOSE = "</think>"
+
+    def __init__(self):
+        self.in_think = False
+        self._buf = ""
+
+    def _partial_tag_len(self, s: str) -> int:
+        """s 尾部若挂着某个标签的前缀（如 '<thi'），返回该前缀长度，否则 0。"""
+        for tag in (self.OPEN, self.CLOSE):
+            for k in range(min(len(s), len(tag) - 1), 0, -1):
+                if s.endswith(tag[:k]):
+                    return k
+        return 0
+
+    def feed(self, delta: str) -> str:
+        self._buf += delta
+        out: list[str] = []
+        pos = 0
+        while pos < len(self._buf):
+            if self.in_think:
+                j = self._buf.find(self.CLOSE, pos)
+                if j >= 0:
+                    pos = j + len(self.CLOSE)          # 吞掉推理块，跳到闭合标签之后
+                    self.in_think = False
+                else:
+                    keep = self._partial_tag_len(self._buf[pos:])
+                    self._buf = self._buf[len(self._buf) - keep:] if keep else ""
+                    return "".join(out)                 # 还在推理块里：全部吞掉
+            else:
+                j = self._buf.find(self.OPEN, pos)
+                if j >= 0:
+                    out.append(self._buf[pos:j])
+                    pos = j + len(self.OPEN)
+                    self.in_think = True
+                else:
+                    keep = self._partial_tag_len(self._buf[pos:])
+                    safe_end = len(self._buf) - keep
+                    if safe_end > pos:
+                        out.append(self._buf[pos:safe_end])
+                    self._buf = self._buf[safe_end:]
+                    return "".join(out)
+        self._buf = ""
+        return "".join(out)
+
+    def flush(self) -> str:
+        """流结束：缓冲里剩的是非标签正文则放行；未闭合的 <think> 残余属于泄漏
+        推理，吞掉不留尾巴。"""
+        rest, self._buf = self._buf, ""
+        if self.in_think:
+            return ""
+        return rest
+
+
 class LineSegmenter:
     """V2 流式 TTS 的增量切句器（COVE §12）：网关 SSE 增量喂进来，切出"可说单元"立刻回调。
     K 的输出协议天然按行分句（一行 = "English line." 中文翻译），所以行就是切分单位；

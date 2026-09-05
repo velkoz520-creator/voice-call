@@ -23,7 +23,7 @@ import os
 import re
 from enum import Enum
 
-from cleanse import split_for_tts, LineSegmenter
+from cleanse import split_for_tts, LineSegmenter, ThinkFilter
 import time
 import uuid
 import wave
@@ -168,6 +168,7 @@ async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict |
     parts: list[str] = []
     first_at = None
     segmenter = LineSegmenter() if on_segment is not None else None
+    think_filter = ThinkFilter()   # thinking 渠道把推理混进 content（9-05 朗读内心独白案）
 
     async def _emit(line: str) -> None:
         if on_segment is not None:
@@ -193,10 +194,21 @@ async def _call_gateway(http: aiohttp.ClientSession, turn: dict, metrics: dict |
                     first_at = time.time()
                     if metrics is not None:
                         metrics["gateway_first_at"] = first_at
-                parts.append(piece)
+                clean = think_filter.feed(piece)   # <think> 块剥在切句/归档之前：字幕朗读落盘三处干净
+                if not clean:
+                    continue
+                parts.append(clean)
                 if segmenter is not None:
-                    for seg in segmenter.feed(piece):
+                    for seg in segmenter.feed(clean):
                         await _emit(seg)
+        if think_filter.in_think:
+            print("[gateway] warn: <think> 未闭合到流尾，推理块已整体丢弃", flush=True)
+        tail_text = think_filter.flush()
+        if tail_text:
+            parts.append(tail_text)
+            if segmenter is not None:
+                for seg in segmenter.feed(tail_text):
+                    await _emit(seg)
         if segmenter is not None:
             tail = segmenter.flush()
             if tail:
