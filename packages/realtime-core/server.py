@@ -364,15 +364,21 @@ async def request_reply(http: aiohttp.ClientSession, turn: dict, metrics: dict |
 
 # 语气中间协议 → 各家 TTS 方言映射（K 在措辞里只用中间协议，方言由清洗层转译；
 # 换 TTS 厂商只改这里，措辞零改动。语法依据各官方文档，比武时逐家实测校准。）
-async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | None = None) -> bytes | None:
-    """TTS：主赛道 elevenlabs；minimax 为 M1 后桩位。
-    没有 TTS provider 时仍回传文本（字幕先行）。
-    metrics 非 None 时记录 tts_request_at / tts_first_byte_at / tts_done_at（M1.5）。"""
-    if TTS_PROVIDER == "mock" or not text:
-        return None
-    if metrics is not None:
-        metrics["tts_request_at"] = time.time()
-    if TTS_PROVIDER == "elevenlabs":
+# MiniMax 备胎 TTS（9-05 天天拍板方案）：主赛道 ElevenLabs 断气（额度/风控）时
+# 同轮自动切 MiniMax t2a_v2——电话永不断气。音色需在 MiniMax 侧单独挑（env 配置）。
+MINIMAX_API_KEY = os.getenv("PAIVOICE_MINIMAX_API_KEY", "")
+MINIMAX_GROUP_ID = os.getenv("PAIVOICE_MINIMAX_GROUP_ID", "")
+MINIMAX_VOICE_ID = os.getenv("PAIVOICE_MINIMAX_VOICE_ID", "")
+MINIMAX_MODEL = os.getenv("PAIVOICE_MINIMAX_MODEL", "speech-01-turbo")
+
+
+def _minimax_ready() -> bool:
+    return bool(MINIMAX_API_KEY and MINIMAX_GROUP_ID and MINIMAX_VOICE_ID)
+
+
+async def _synthesize_with(http: aiohttp.ClientSession, provider: str, text: str,
+                           metrics: dict | None = None) -> bytes | None:
+    if provider == "elevenlabs":
         if not TTS_KEY or not ELEVEN_VOICE:
             raise RuntimeError("TTS provider is not configured")
         headers = {"xi-api-key": TTS_KEY, "accept": "audio/mpeg", "content-type": "application/json"}
@@ -399,9 +405,65 @@ async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | Non
                 metrics["tts_done_at"] = done
             audio = b"".join(chunks)
             return audio if audio else None
-    if TTS_PROVIDER == "minimax":
-        raise RuntimeError("minimax TTS 桩位：M1 后接（t2a_v2，需 GROUP_ID）")
+    if provider == "minimax":
+        if not _minimax_ready():
+            raise RuntimeError("minimax TTS not configured (need API_KEY/GROUP_ID/VOICE_ID)")
+        # t2a_v2：响应 JSON 的 data.audio 是 hex 编码 mp3（MiniMax 特色）
+        url = f"https://api.minimax.chat/v1/t2a_v2?GroupId={MINIMAX_GROUP_ID}"
+        headers = {"authorization": f"Bearer {MINIMAX_API_KEY}", "content-type": "application/json"}
+        body = {
+            "model": MINIMAX_MODEL,
+            "text": text,
+            "stream": False,
+            "voice_setting": {"voice_id": MINIMAX_VOICE_ID, "speed": 1.0, "vol": 1.0, "pitch": 0},
+            "audio_setting": {
+                "sample_rate": 32000, "bitrate": 128000, "format": "mp3", "channel": 1,
+            },
+        }
+        async with http.post(url, headers=headers, json=body) as response:
+            if response.status != 200:
+                detail = (await response.text())[:200]
+                raise RuntimeError(f"minimax TTS failed ({response.status}): {detail}")
+            data = await response.json()
+            # MiniMax 把业务错误包在 200 里：base_resp.status_code 非 0 = 失败
+            base = data.get("base_resp") or {}
+            if base.get("status_code", 0) != 0:
+                raise RuntimeError(f"minimax TTS biz error {base.get('status_code')}: {base.get('status_msg', '')[:120]}")
+            audio_hex = (data.get("data") or {}).get("audio", "")
+            if not audio_hex:
+                return None
+            audio = bytes.fromhex(audio_hex)
+            if metrics is not None and metrics.get("tts_first_byte_at") is None:
+                metrics["tts_first_byte_at"] = time.time()
+                metrics["tts_done_at"] = time.time()
+            return audio or None
     raise RuntimeError("TTS provider is not configured")
+
+
+async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | None = None) -> bytes | None:
+    """TTS：主赛道 elevenlabs；断气（额度/风控/网络）时自动切 MiniMax 备胎（9-05 拍板：
+    '主赛道 ElevenLabs，额度烧干时自动切过去，电话永不断气'）。备胎未配置则原样抛错。
+    没有 TTS provider 时仍回传文本（字幕先行）。
+    metrics 非 None 时记录 tts_request_at / tts_first_byte_at / tts_done_at（M1.5）。"""
+    if TTS_PROVIDER == "mock" or not text:
+        return None
+    if metrics is not None:
+        metrics["tts_request_at"] = time.time()
+    try:
+        return await _synthesize_with(http, TTS_PROVIDER, text, metrics)
+    except Exception as primary_err:
+        # 备胎只在主赛道是 elevenlabs 且其失败时接管；minimax 自身失败不再套娃
+        if TTS_PROVIDER == "elevenlabs" and _minimax_ready():
+            print(f"[tts] primary failed, falling back to minimax: {str(primary_err)[:150]}", flush=True)
+            try:
+                audio = await _synthesize_with(http, "minimax", text, None)
+                if metrics is not None:
+                    metrics["tts_fallback"] = "minimax"
+                return audio
+            except Exception as backup_err:
+                print(f"[tts] minimax backup also failed: {str(backup_err)[:150]}", flush=True)
+                raise backup_err   # 双双阵亡必须上抛——静默 None 会让熔断器永不计数（自测抓到）
+        raise
 
 
 async def archive_call(http: aiohttp.ClientSession, call_id: str, turns: list, duration_ms: int) -> bool:
