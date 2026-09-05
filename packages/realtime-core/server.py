@@ -588,7 +588,9 @@ class Call:
         self.vad_tail = []
         self.vad_seg_ctx = []
         self.seg_tasks = []
-        if ASR_CHUNK:
+        if ASR_CHUNK and ASR_PROVIDER == "local":
+            # 切段的前提是本地识别（段识别写死 _transcribe_local）；provider 切回
+            # 云端时切段自动解除，绝不意外加载 240MB 本地模型
             try:
                 if self.vad is None:
                     self.vad = _get_vad_model()
@@ -602,6 +604,8 @@ class Call:
             # 否则起音在实时流开始前就丢了——句首补料
             if preroll:
                 _vad_feed(self, bytes(preroll))
+        else:
+            self.vad = None
 
     def end_turn(self) -> bytes:
         self.active = False
