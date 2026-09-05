@@ -36,7 +36,7 @@ SAMPLE_RATE = 16_000
 HOST = os.getenv("PAIVOICE_HOST", "127.0.0.1")
 PORT = int(os.getenv("PAIVOICE_PORT", "8780"))
 TOKEN = os.getenv("PAIVOICE_TOKEN", "")
-ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")          # mock | groq | siliconflow
+ASR_PROVIDER = os.getenv("PAIVOICE_ASR_PROVIDER", "mock")          # mock | groq | siliconflow | local
 TTS_PROVIDER = os.getenv("PAIVOICE_TTS_PROVIDER", "mock")          # mock | elevenlabs | minimax(桩)
 ASR_KEY = os.getenv("PAIVOICE_ASR_API_KEY") or os.getenv("GROQ_API_KEY", "")
 TTS_KEY = os.getenv("PAIVOICE_TTS_API_KEY") or os.getenv("ELEVENLABS_API_KEY", "")
@@ -45,6 +45,13 @@ ELEVEN_VOICE = os.getenv("PAIVOICE_ELEVEN_VOICE_ID", "")
 ELEVEN_MODEL = os.getenv("PAIVOICE_ELEVEN_MODEL", "eleven_multilingual_v2")  # v3 填 eleven_v3
 # v3 专属：stability 三档 Creative(0.0 最有表现力)/Natural(0.5 均衡)/Robust(1.0 最稳)。要 audio tags 表现力选前两档
 ELEVEN_STABILITY = os.getenv("PAIVOICE_ELEVEN_STABILITY", "")
+
+# 容器本地 ASR（9-05 天天拍板）：SenseVoiceSmall ONNX 经 sherpa-onnx 跑在容器内——
+# 同一只耳朵（比武场冠军同款模型），砍掉跨太平洋上传（9-03 实测 ASR 平均 5.5s 的大头）。
+# 模型文件由 Dockerfile 构建期下载（Ashburn→GitHub 快线），路径可用 PAIVOICE_LOCAL_ASR_DIR 覆盖。
+LOCAL_ASR_DIR = os.getenv("PAIVOICE_LOCAL_ASR_DIR", "/app/asr-model")
+_local_recognizer = None          # 懒加载（首句才初始化，不拖启动）
+_local_recognizer_lock = __import__("threading").Lock()
 
 # 大脑：网关语音快车道（OpenAI 兼容 + SSE）。UA 必须带 pai-voice，网关靠它分流。
 GATEWAY_URL = os.getenv("PAIVOICE_GATEWAY_URL", "")
@@ -119,10 +126,60 @@ def wav(pcm: bytes) -> bytes:
     return buffer.getvalue()
 
 
+def _get_local_recognizer():
+    """懒加载容器本地 SenseVoice 识别器（sherpa-onnx + int8 ONNX，纯 CPU）。
+    双重检查锁：首句才初始化（不拖容器启动），并发轮只建一次。"""
+    global _local_recognizer
+    if _local_recognizer is not None:
+        return _local_recognizer
+    with _local_recognizer_lock:
+        if _local_recognizer is not None:
+            return _local_recognizer
+        import sherpa_onnx
+        model_path = os.path.join(LOCAL_ASR_DIR, "model.int8.onnx")
+        tokens_path = os.path.join(LOCAL_ASR_DIR, "tokens.txt")
+        if not os.path.exists(model_path):
+            raise RuntimeError(f"local ASR model missing: {model_path}")
+        t0 = time.time()
+        recognizer = sherpa_onnx.OfflineRecognizer.from_sense_voice(
+            model=model_path, tokens=tokens_path, use_itn=True,
+            num_threads=max(1, (os.cpu_count() or 2) // 2),
+        )
+        print(f"[asr-local] SenseVoice int8 loaded in {time.time() - t0:.1f}s "
+              f"(threads={max(1, (os.cpu_count() or 2) // 2)})", flush=True)
+        _local_recognizer = recognizer
+        return recognizer
+
+
+def _transcribe_local(pcm: bytes) -> str:
+    """同步识别（sherpa-onnx 无原生异步）；直接吃 PCM16，连 WAV 编码都省了。
+    在 to_thread 里跑，不碰事件循环。"""
+    import array
+    recognizer = _get_local_recognizer()
+    samples = array.array("h")
+    samples.frombytes(pcm[: (len(pcm) // 2) * 2])
+    stream = recognizer.create_stream()
+    stream.accept_waveform(SAMPLE_RATE, samples.tolist())
+    recognizer.decode_stream(stream)
+    return stream.result.text.strip()
+
+
 async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
-    """Return text only. Provider errors are intentionally safe to show."""
+    """Return text only. Provider errors are intentionally safe to show.
+    local 容器内推理；异常时自动回落 SiliconFlow（同一只耳朵的云备份），电话不断。"""
     if ASR_PROVIDER == "mock":
         return ""
+    if ASR_PROVIDER == "local":
+        try:
+            t0 = time.time()
+            text = await asyncio.to_thread(_transcribe_local, pcm)
+            print(f"[asr-local] {len(pcm) // 3200}0ms audio -> {time.time() - t0:.2f}s "
+                  f"({(len(pcm) // 2) / SAMPLE_RATE:.1f}s audio)", flush=True)
+            return text
+        except Exception as e:
+            if not ASR_KEY:
+                raise
+            print(f"[asr-local] failed, falling back to siliconflow: {e}", flush=True)
     if not ASR_KEY:
         raise RuntimeError("ASR provider is not configured")
 
