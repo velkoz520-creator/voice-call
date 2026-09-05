@@ -73,18 +73,19 @@ _vad_model_lock = __import__("threading").Lock()
 
 def _ensure_model_file(path: str, url: str) -> str:
     """模型文件缺失时运行时下载（zbpack 缓存坑的兜底：镜像没带模型也能自愈）。
-    返回路径；下载失败抛异常由调用方决定回落。"""
+    用 urllib 标准库——容器里没有 requests（9-05 实测踩坑）。返回路径；失败抛异常由调用方回落。"""
     if os.path.exists(path):
         return path
     os.makedirs(os.path.dirname(path), exist_ok=True)
-    import requests as _requests
+    import urllib.request
     print(f"[asr-local] downloading {url} -> {path}", flush=True)
     tmp = path + ".part"
-    with _requests.get(url, stream=True, timeout=(10, 300)) as r:
-        r.raise_for_status()
-        with open(tmp, "wb") as f:
-            for chunk in r.iter_content(chunk_size=1 << 20):
-                f.write(chunk)
+    with urllib.request.urlopen(url, timeout=300) as r, open(tmp, "wb") as f:
+        while True:
+            chunk = r.read(1 << 20)
+            if not chunk:
+                break
+            f.write(chunk)
     os.replace(tmp, path)
     return path
 
