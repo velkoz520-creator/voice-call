@@ -66,6 +66,7 @@
   </div>
 
   <div id="state">待机</div>
+  <div id="muteTip" style="text-align:center;font-size:12px;color:#ff8a7a;min-height:16px;letter-spacing:2px;"></div>
   <div id="lat"></div>
   <div id="stage">
     <div class="ring" id="r1"></div><div class="ring" id="r2"></div>
@@ -132,6 +133,12 @@ $('dial').onclick = async () => {
       error: e => addSub('line-zh', '⚠ ' + e),
       latency: ms => { $('lat').textContent = '开口 ' + ms + 'ms'; },
       hangupSoon: () => { $('state').textContent = '道别中…'; },
+      micSilent: () => {   // 90 秒没收到任何声音：大概率误触静音（9-05 她 98 分钟打字案）
+        addSub('line-zh', '🎤 好久没听到你的声音了——想说的话，检查左下角麦克风键是否被误触，或系统是否占用了麦克风');
+      },
+      nothingHeard: () => {   // 服务端确认收到音频但判定无语音：管子是通的，是环境音/没听清
+        addSub('line-zh', '（没听清你说话——再说一遍？）');
+      },
       autoHangup: () => {   // 自然挂断（COVE §16）：他说完告别、宽限期过完，服务端请我们收线
         if (window._hb) clearInterval(window._hb);
         $('state').textContent = '已挂断';
@@ -157,6 +164,7 @@ $('hang').onclick = () => {
   if (call) { call.hangup(); call = null; } location.reload();
 };
 $('mute').onclick = () => { muted = !muted; $('mute').classList.toggle('off', muted);
+  $('muteTip').textContent = muted ? '已静音——他听不见你了' : '';
   if (call?.stream) call.stream.getAudioTracks().forEach(t => t.enabled = !muted); };
 
 // 打字条：不想说出口的字，打给他。服务端回 transcript 回显到字幕，本地不重复显示。

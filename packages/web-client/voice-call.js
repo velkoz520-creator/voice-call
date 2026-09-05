@@ -78,6 +78,7 @@ export class VoiceCall {
     this.noise = 0.01; this._hot = 0; this._silenceSince = 0; this._hotSince = 0; this._lastHotAt = 0; this._speechMin = 1;
     this._lastTickAt = 0; this._voicedMs = 0; this._speechStartedAt = 0;
     this._ducked = false; this._duckSilentSince = 0;   // 两阶段 barge-in 证据
+    this._lastVoiceAt = 0; this._micHinted = false;    // 麦克风健康观察（误触静音检测）
     this.generationId = null;
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
     this.video = null; this._frameTimer = null; this.canvas = null;
@@ -169,7 +170,17 @@ export class VoiceCall {
     if (this.playing) enter *= this.vad.speakingGain;
     const exit = enter * this.vad.exitRatio;
 
-    if (rms > enter) this._lastHotAt = now;
+    if (rms > enter) {
+      this._lastHotAt = now;
+      this._lastVoiceAt = now; this._micHinted = false;
+    }
+
+    // 麦克风健康观察：聆听中连续 90 秒收不到任何超过门槛的声音——大概率误触了
+    // 静音键（9-05 她 98 分钟打字案的头号嫌疑）。只提示一次，开口即复位。
+    if (!this.speaking && this._lastVoiceAt && now - this._lastVoiceAt >= 90000 && !this._micHinted) {
+      this._micHinted = true;
+      this.emit('micSilent');
+    }
 
     if (!this.speaking) {
       if (rms > enter) {
@@ -244,6 +255,7 @@ export class VoiceCall {
     this.speaking = true; this._speechMin = 1; this._lastHotAt = performance.now(); this._silenceSince = 0;
     this._speechStartedAt = performance.now(); this._voicedMs = 0;   // 自适应停句：本轮有声累计从零起算
     this._ducked = false; this._duckSilentSince = 0;
+    this._lastVoiceAt = performance.now(); this._micHinted = false;
     this.emit('speech', true);
     // 只在听得到正式回复时打断；思考中、短提示音或误触都让他继续准备。
     const barge = this.playing && this.mode === 'speaking';

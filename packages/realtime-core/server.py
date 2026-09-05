@@ -261,7 +261,10 @@ async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | Non
         url = f"https://api.elevenlabs.io/v1/text-to-speech/{ELEVEN_VOICE}/stream"
         async with http.post(url, headers=headers, json=body) as response:
             if response.status != 200:
-                raise RuntimeError(f"TTS request failed ({response.status})")
+                # 带响应体：401 风暴（9-05 她实测，持续 19 分钟后自愈）到底是 quota_exceeded
+                # 还是限流，不看 body 只能瞎猜
+                detail = (await response.text())[:200]
+                raise RuntimeError(f"TTS request failed ({response.status}): {detail}")
             first = True
             chunks: list[bytes] = []
             async for chunk in response.content.iter_chunked(16384):
@@ -516,6 +519,8 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             # （打断/挂断）则该轮 reply 不入档，与 M1.5-3"被顶轮生成即止"语义一致。
             seg_parts: list[str] = []
             seg_first_done = False
+            tts_fail_streak = 0        # TTS 熔断器（9-05 她 401 风暴案：每段空转 1.5~2s 拖死整轮）
+            tts_muted_until = 0.0
 
             def _is_cjk_line(text: str) -> bool:
                 """去标点空白后含中文且非点缀（CJK≥2 字且占比≥1/3）→ 中文行。
@@ -529,7 +534,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                 return cjk >= 2 and cjk * 3 >= len(s)
 
             async def _emit_segment(line: str) -> None:
-                nonlocal seg_first_done
+                nonlocal seg_first_done, tts_fail_streak, tts_muted_until
                 seg_parts.append(line)
                 if generation != call.generation:
                     return  # 已被顶替/打断：字幕音频都不再出（文本照攒，方便日志排查）
@@ -546,6 +551,8 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                                     "turn_id": turn_id, "text": caption})
                 if not spoken or skip_tts:
                     return
+                if time.time() < tts_muted_until:
+                    return  # 熔断中：字幕照常，TTS 跳过不空转
                 seg_metrics = None
                 if not seg_first_done:   # 延迟指标只看首段（后续段不覆盖 *_at）
                     seg_first_done = True
@@ -553,8 +560,15 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                     seg_metrics = metrics
                 try:
                     audio = await synthesize(http, spoken, seg_metrics)
+                    tts_fail_streak = 0
                 except Exception as e:
-                    print(f"[tts-seg] failed: {e}", flush=True)  # 单段失败跳过，后续段继续
+                    tts_fail_streak += 1
+                    if tts_fail_streak >= 3:
+                        tts_muted_until = time.time() + 90   # 连续3败→熔断90s，电话继续（字幕在）
+                        tts_fail_streak = 0
+                        print(f"[tts-seg] circuit OPEN 90s after 3 fails; last: {e}", flush=True)
+                    else:
+                        print(f"[tts-seg] failed: {e}", flush=True)  # 单段失败跳过，后续段继续
                     return
                 if audio and generation == call.generation:
                     call.set_state(CallState.K_SPEAKING)
