@@ -67,6 +67,7 @@ SENSEVOICE_TOKENS_URL = os.getenv(
     "PAIVOICE_SENSEVOICE_TOKENS_URL",
     "https://huggingface.co/csukuangfj/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/resolve/main/tokens.txt")
 VAD_MAX_SEGMENT_S = float(os.getenv("PAIVOICE_VAD_MAX_SEGMENT_S", "25"))
+VAD_CTX_SAMPLES = int(SAMPLE_RATE * 0.4)   # 段头垫的起音前上下文（防 silero 起音漏判吞字）
 _vad_model = None                 # VadModel 单例（状态在实例上，Call 层用 reset 复用）
 _vad_model_lock = __import__("threading").Lock()
 
@@ -127,10 +128,13 @@ ASR_HALLUCINATION_MULTI = {
     "嗯嗯", "嗯嗯嗯", "啊啊", "句号", "逗号", "问号", "感叹号", "省略号",
     "谢谢观看", "谢谢收看", "谢谢大家", "请不吝点赞", "订阅", "关注我们",
     # 英文幻听词（匹配前已去空格去标点并转小写，故 here 无空格）
-    # 9-05 她实测补：VAD 漏检碎片段常识别成单虚词（"the"），一并拉黑
+    # 9-05 她实测补：VAD 漏检碎片段常识别成单虚词（"the"），一并拉黑；
+    # 9-05 晚补：阈值降到 0.3 后呼吸段变多，SenseVoice 对气流声的经典幻觉
+    # "okay"（拼全词，不是 ok）高频出没——幽灵 okay 案
     "um", "uh", "hm", "mm", "hmm", "mhm", "huh", "bye", "you",
     "thankyou", "thanksforwatching",
     "the", "a", "an", "and", "to", "it", "is", "or", "so", "yeah", "ok",
+    "okay", "hello", "hi", "well", "right",
 }
 MIN_SPEECH_RMS = 150  # int16 满量程 32767；低于此当环境音丢弃（比前端 VAD 门限还低，双保险）
 
@@ -201,8 +205,8 @@ def _get_vad_model():
         cfg = sherpa_onnx.VadModelConfig()
         cfg.silero_vad.model = model_path
         # 9-05 她实测调参：0.5 对轻声尾音太严（"我就先修改呗"整个尾段被判静音丢弃）；
-        # 0.35 + 0.7s 闭合更保守——尾音并入段里，代价是段稍长
-        cfg.silero_vad.threshold = 0.35
+        # 0.3 + 0.7s 闭合更保守——尾音并入段里，代价是段稍长
+        cfg.silero_vad.threshold = 0.3
         cfg.silero_vad.min_silence_duration = 0.7
         cfg.silero_vad.min_speech_duration = 0.25
         cfg.sample_rate = SAMPLE_RATE
@@ -563,6 +567,8 @@ class Call:
     vad_cur: list = field(default_factory=list)          # 当前段累积样本
     vad_speech_win: int = 0             # 当前段有声样本数
     vad_silence_win: int = 0            # 当前段尾部静音样本数
+    vad_tail: list = field(default_factory=list)         # 滚动音频尾（起音前上下文，0.4s）
+    vad_seg_ctx: list = field(default_factory=list)      # 段起音时刻的上下文快照（垫进段头）
     seg_tasks: list = field(default_factory=list)        # 在途段转写 asyncio.Task
 
     def set_state(self, s: CallState) -> None:
@@ -579,6 +585,8 @@ class Call:
         self.vad_cur = []
         self.vad_speech_win = 0
         self.vad_silence_win = 0
+        self.vad_tail = []
+        self.vad_seg_ctx = []
         self.seg_tasks = []
         if ASR_CHUNK:
             try:
@@ -628,12 +636,17 @@ def _vad_feed(call: Call, pcm: bytes) -> None:
     max_sp = int(SAMPLE_RATE * VAD_MAX_SEGMENT_S)
     for pos in range(0, len(samples) - win + 1, win):
         window = samples[pos:pos + win]
-        if call.vad.is_speech(window):
+        hot = call.vad.is_speech(window)
+        if hot and not call.vad_cur:
+            # 起音时刻：快照此前 0.4s 原始音频垫进段头——silero 刚 reset 判定偏晚时，
+            # 起音真音频照样进识别料（9-05 她实测开口吞字案）
+            call.vad_seg_ctx = list(call.vad_tail)
+        if hot:
             call.vad_cur.extend(window)
             call.vad_speech_win += win
             call.vad_silence_win = 0
             if call.vad_speech_win >= max_sp:          # 单段硬上限强切
-                _schedule_segment(call, call.vad_cur)
+                _schedule_segment(call, call.vad_cur, ctx=None)   # 段中强切无起音问题，不垫
                 call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
         else:
             if call.vad_cur:
@@ -641,14 +654,21 @@ def _vad_feed(call: Call, pcm: bytes) -> None:
                 call.vad_silence_win += win
                 if call.vad_silence_win >= min_sil:    # 静音过阈：段闭合
                     if call.vad_speech_win >= min_sp:
-                        _schedule_segment(call, call.vad_cur[:len(call.vad_cur) - call.vad_silence_win])
+                        _schedule_segment(call, call.vad_cur[:len(call.vad_cur) - call.vad_silence_win],
+                                          ctx=call.vad_seg_ctx)
                     call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
+        call.vad_tail.extend(window)                    # 滚动音频尾（含静音窗）
+        if len(call.vad_tail) > VAD_CTX_SAMPLES:
+            del call.vad_tail[:len(call.vad_tail) - VAD_CTX_SAMPLES]
 
 
-def _schedule_segment(call: Call, samples_list: list) -> None:
-    """闭合段 → 后台转写任务（结果挂在任务上，speech_end 时统一收割拼接）。"""
+def _schedule_segment(call: Call, samples_list: list, ctx: list | None = None) -> None:
+    """闭合段 → 后台转写任务（结果挂在任务上，speech_end 时统一收割拼接）。
+    ctx：起音前上下文（垫段头，防起音漏判吞字）。"""
     import array
-    pcm = array.array("h", samples_list).tobytes()
+    merged = list(ctx) if ctx else []
+    merged.extend(samples_list)
+    pcm = array.array("h", merged).tobytes()
 
     async def _run() -> str:
         try:
@@ -669,10 +689,13 @@ async def _flush_vad_transcript(call: Call) -> str:
     if not ASR_CHUNK or call.vad is None:
         return ""
     # 尾段兜底（9-05 她实测吞尾句案）：只要还有残余音频就识别一次，
-    # 生死交给幻听过滤——silero 把轻尾音判成静音时，这里就是最后一道救回的机会
-    if call.vad_cur:
-        _schedule_segment(call, call.vad_cur)
+    # 生死交给幻听过滤——silero 把轻尾音判成静音时，这里就是最后一道救回的机会。
+    # 但要攒够 0.8s 音频才送：阈值降到 0.3 后呼吸会攒进 vad_cur，过短的送识别
+    # 就是给 SenseVoice 的气流幻觉（幽灵"okay"）开闸——真尾句 1.5s 左右不受影响
+    if call.vad_cur and len(call.vad_cur) >= int(SAMPLE_RATE * 0.8):
+        _schedule_segment(call, call.vad_cur, ctx=call.vad_seg_ctx)
     call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
+    call.vad_tail, call.vad_seg_ctx = [], []
     tasks = list(call.seg_tasks)
     call.seg_tasks = []
     if not tasks:

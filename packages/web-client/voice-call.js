@@ -61,7 +61,7 @@ export class VoiceCall {
       interruptMs: 520,
       restoreMs: 160,
       duckGain: 0.25,      // duck 时他的音量压到基准的 25%
-      playGain: 1.5,       // 播放基准增益（9-05 天天要求原生更大声；>1 为数字放大，源音频有余量）
+      playGain: 2.2,       // 播放基准增益（9-05 她反馈1.5仍小；配压缩器防爆音）
       floor: 0.006,        // 最低噪声底
       gain: 3.2,           // 进入阈值 = max(floor, 噪声底 * gain)
       exitRatio: 0.62,     // 结束阈值 = 进入阈值 * 这个（双阈值，防止悬在临界卡住）
@@ -101,10 +101,15 @@ export class VoiceCall {
     const workletUrl = URL.createObjectURL(blob);
     await this.ctx.audioWorklet.addModule(workletUrl);
     this.outGain = this.ctx.createGain();
-    this.outGain.gain.value = this.vad.playGain;   // 播放基准增益（9-05 天天要求原生更大声）
+    this.outGain.gain.value = this.vad.playGain;   // 播放基准增益（9-05 她反馈1.5仍小，提至2.2）
+    // 压缩器兜峰值：推大响度的同时防削波爆音
+    this.comp = this.ctx.createDynamicsCompressor();
+    this.comp.threshold.value = -24; this.comp.knee.value = 20;
+    this.comp.ratio.value = 6; this.comp.attack.value = 0.005; this.comp.release.value = 0.15;
     this.analyser = this.ctx.createAnalyser();
     this.analyser.fftSize = 512;
-    this.outGain.connect(this.analyser);
+    this.outGain.connect(this.comp);
+    this.comp.connect(this.analyser);
     this.analyser.connect(this.ctx.destination);
     this._ampBuf = new Uint8Array(this.analyser.fftSize);
     const ampLoop = () => {
