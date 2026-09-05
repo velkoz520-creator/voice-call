@@ -217,13 +217,16 @@ def _get_vad_model():
 
 def _transcribe_local(pcm: bytes) -> str:
     """同步识别（sherpa-onnx 无原生异步）；直接吃 PCM16，连 WAV 编码都省了。
-    在 to_thread 里跑，不碰事件循环。decode 全局锁串行（保守线程安全）。"""
+    在 to_thread 里跑，不碰事件循环。decode 全局锁串行（保守线程安全）。
+    波形归一化到 [-1,1] 浮点——accept_waveform 的接口要求（闻序 9-06 P1：
+    此前直传 int16 整数，值域饱和 3 万倍）。"""
     import array
     recognizer = _get_local_recognizer()
     samples = array.array("h")
     samples.frombytes(pcm[: (len(pcm) // 2) * 2])
+    floats = [s / 32768.0 for s in samples]
     stream = recognizer.create_stream()
-    stream.accept_waveform(SAMPLE_RATE, samples.tolist())
+    stream.accept_waveform(SAMPLE_RATE, floats)
     with _local_decode_lock:
         recognizer.decode_stream(stream)
         return stream.result.text.strip()
@@ -231,20 +234,26 @@ def _transcribe_local(pcm: bytes) -> str:
 
 async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
     """Return text only. Provider errors are intentionally safe to show.
-    local 容器内推理；异常时自动回落 SiliconFlow（同一只耳朵的云备份），电话不断。"""
+    local 容器内推理；异常时自动回落 SiliconFlow（同一只耳朵的云备份），电话不断。
+    （闻序 9-06 P1：回落此前不可达——ASR_PROVIDER 全局仍是 local，云端分支永远
+    匹配不上。修：本次请求的局部 effective_provider。）"""
     if ASR_PROVIDER == "mock":
         return ""
-    if ASR_PROVIDER == "local":
+    provider = ASR_PROVIDER
+    if provider == "local":
         try:
             t0 = time.time()
             text = await asyncio.to_thread(_transcribe_local, pcm)
-            print(f"[asr-local] {len(pcm) // 3200}0ms audio -> {time.time() - t0:.2f}s "
+            print(f"[asr-local] {len(pcm) // 320}0ms audio -> {time.time() - t0:.2f}s "
                   f"({(len(pcm) // 2) / SAMPLE_RATE:.1f}s audio)", flush=True)
             return text
         except Exception as e:
             if not ASR_KEY:
                 raise
             print(f"[asr-local] failed, falling back to siliconflow: {e}", flush=True)
+            provider = "siliconflow"   # 只切本次请求，不动全局配置
+    if provider == "local":            # 理论不可达，保险
+        raise RuntimeError("ASR provider unresolved")
     if not ASR_KEY:
         raise RuntimeError("ASR provider is not configured")
 
@@ -252,11 +261,11 @@ async def transcribe(http: aiohttp.ClientSession, pcm: bytes) -> str:
     form.add_field("file", wav(pcm), filename="turn.wav", content_type="audio/wav")
     form.add_field("language", "zh")
 
-    if ASR_PROVIDER == "siliconflow":
+    if provider == "siliconflow":
         form.add_field("model", os.getenv("PAIVOICE_SILICONFLOW_ASR_MODEL",
                                           "FunAudioLLM/SenseVoiceSmall"))
         url = "https://api.siliconflow.cn/v1/audio/transcriptions"
-    elif ASR_PROVIDER == "groq":
+    elif provider == "groq":
         form.add_field("model", GROQ_MODEL)
         url = "https://api.groq.com/openai/v1/audio/transcriptions"
     else:
@@ -376,8 +385,15 @@ def _minimax_ready() -> bool:
     return bool(MINIMAX_API_KEY and MINIMAX_GROUP_ID and MINIMAX_VOICE_ID)
 
 
+# 主赛道（elevenlabs）跨轮熔断器（闻序 9-06 P1：局部变量每轮清零，主厂商持续故障时
+# 每句都要先白等一次失败才切备胎）。连续 3 败 → 冷却 90s，期间直接走备胎。
+_tts_breaker = {"fails": 0, "cooldown_until": 0.0}
+_TTS_BREAKER_THRESHOLD = 3
+_TTS_BREAKER_COOLDOWN = 90.0
+
+
 async def _synthesize_with(http: aiohttp.ClientSession, provider: str, text: str,
-                           metrics: dict | None = None) -> bytes | None:
+                           metrics: dict | None = None, raw_line: str | None = None) -> bytes | None:
     if provider == "elevenlabs":
         if not TTS_KEY or not ELEVEN_VOICE:
             raise RuntimeError("TTS provider is not configured")
@@ -404,10 +420,17 @@ async def _synthesize_with(http: aiohttp.ClientSession, provider: str, text: str
             if metrics is not None:
                 metrics["tts_done_at"] = done
             audio = b"".join(chunks)
+            if audio:
+                _tts_breaker["fails"] = 0   # 主赛道活着：清零失败计数
+                _tts_breaker["cooldown_until"] = 0.0
             return audio if audio else None
     if provider == "minimax":
         if not _minimax_ready():
             raise RuntimeError("minimax TTS not configured (need API_KEY/GROUP_ID/VOICE_ID)")
+        if raw_line:
+            # 闻序 9-06 P1：主赛道失败时传来的 text 已按 elevenlabs 方言转译过
+            # （[laughs] 直通等）——备胎必须按自己的方言重转译原始行
+            text = split_for_tts(raw_line, "minimax")[0] or text
         # t2a_v2：响应 JSON 的 data.audio 是 hex 编码 mp3（MiniMax 特色）
         url = f"https://api.minimax.chat/v1/t2a_v2?GroupId={MINIMAX_GROUP_ID}"
         headers = {"authorization": f"Bearer {MINIMAX_API_KEY}", "content-type": "application/json"}
@@ -440,9 +463,12 @@ async def _synthesize_with(http: aiohttp.ClientSession, provider: str, text: str
     raise RuntimeError("TTS provider is not configured")
 
 
-async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | None = None) -> bytes | None:
+async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | None = None,
+                     raw_line: str | None = None) -> bytes | None:
     """TTS：主赛道 elevenlabs；断气（额度/风控/网络）时自动切 MiniMax 备胎（9-05 拍板：
     '主赛道 ElevenLabs，额度烧干时自动切过去，电话永不断气'）。备胎未配置则原样抛错。
+    主赛道带跨轮熔断器：连续 3 败冷却 90s，期间直接走备胎不再白等（闻序 9-06 P1）。
+    raw_line：未经方言转译的原始行——备胎按自己方言重转译用。
     没有 TTS provider 时仍回传文本（字幕先行）。
     metrics 非 None 时记录 tts_request_at / tts_first_byte_at / tts_done_at（M1.5）。"""
     if TTS_PROVIDER == "mock" or not text:
@@ -450,13 +476,18 @@ async def synthesize(http: aiohttp.ClientSession, text: str, metrics: dict | Non
     if metrics is not None:
         metrics["tts_request_at"] = time.time()
     try:
-        return await _synthesize_with(http, TTS_PROVIDER, text, metrics)
+        return await _synthesize_with(http, TTS_PROVIDER, text, metrics, raw_line=raw_line)
     except Exception as primary_err:
+        _tts_breaker["fails"] += 1
+        if _tts_breaker["fails"] >= _TTS_BREAKER_THRESHOLD:
+            _tts_breaker["cooldown_until"] = time.time() + _TTS_BREAKER_COOLDOWN
+            _tts_breaker["fails"] = 0
+            print(f"[tts] primary circuit OPEN {_TTS_BREAKER_COOLDOWN}s", flush=True)
         # 备胎只在主赛道是 elevenlabs 且其失败时接管；minimax 自身失败不再套娃
         if TTS_PROVIDER == "elevenlabs" and _minimax_ready():
             print(f"[tts] primary failed, falling back to minimax: {str(primary_err)[:150]}", flush=True)
             try:
-                audio = await _synthesize_with(http, "minimax", text, None)
+                audio = await _synthesize_with(http, "minimax", text, None, raw_line=raw_line)
                 if metrics is not None:
                     metrics["tts_fallback"] = "minimax"
                 return audio
@@ -588,6 +619,9 @@ async def log_metrics(call: "Call", turn_seq: int, turn_id: str, generation_id: 
             k: (datetime.datetime.fromtimestamp(v, datetime.timezone.utc).isoformat()
                 if v else None) for k, v in metrics.items() if k.endswith("_at")
         })
+        for k, v in metrics.items():
+            if not k.endswith("_at"):
+                row[k] = v   # 闻序 9-06 P2：非时间戳字段（tts_fallback/farewell 等）也要可见
         print("[metrics] " + json.dumps(row, ensure_ascii=False), flush=True)
         if SB_URL and SB_KEY:
             async with aiohttp.ClientSession() as http:
@@ -631,7 +665,11 @@ class Call:
     vad_silence_win: int = 0            # 当前段尾部静音样本数
     vad_tail: list = field(default_factory=list)         # 滚动音频尾（起音前上下文，0.4s）
     vad_seg_ctx: list = field(default_factory=list)      # 段起音时刻的上下文快照（垫进段头）
-    seg_tasks: list = field(default_factory=list)        # 在途段转写 asyncio.Task
+    vad_pending: list = field(default_factory=list)      # 跨消息残余样本（凑足一个窗口再消费）
+    seg_tasks: list = field(default_factory=list)        # 本轮在途段转写 asyncio.Task
+    all_tasks: set = field(default_factory=set)          # 会话级全部任务追踪（闻序 9-06 P0：挂断统一收割）
+    closing: bool = False               # 收尾中：禁止创建新任务（闻序 9-06 P0）
+    farewell_gen: int = 0               # 告别轮 generation（playback_idle 按 generation 校验）
 
     def set_state(self, s: CallState) -> None:
         if s is not self.state:
@@ -643,28 +681,33 @@ class Call:
         截断到最近 1 秒防异常大包——ASR 对头部静音不敏感，多补无害。"""
         self.active = True
         self.audio = bytearray(preroll[-SAMPLE_RATE * 2:])
-        # VAD 切段：新一轮清状态（在途段任务引用换新，旧任务自然完成结果弃用）
+        # VAD 切段：新一轮清状态。旧轮 seg_tasks 引用已随 vad_pending 快照交给上一轮的
+        # answer_turn 收割，本体由 all_tasks 兜底（闻序 9-06 P0：引用清了任务不能丢）
         self.vad_cur = []
         self.vad_speech_win = 0
         self.vad_silence_win = 0
         self.vad_tail = []
         self.vad_seg_ctx = []
+        self.vad_pending = []
         self.seg_tasks = []
         if ASR_CHUNK and ASR_PROVIDER == "local":
             # 切段的前提是本地识别（段识别写死 _transcribe_local）；provider 切回
             # 云端时切段自动解除，绝不意外加载 240MB 本地模型
             try:
-                if self.vad is None:
-                    self.vad = _get_vad_model()
+                if _vad_model is None:
+                    print("[asr-vad] model not warm yet, whole-turn fallback this round", flush=True)
                 else:
-                    self.vad.reset()
+                    if self.vad is None:
+                        self.vad = _vad_model
+                    else:
+                        self.vad.reset()
             except Exception as e:
                 print(f"[asr-vad] unavailable, whole-turn fallback: {e}", flush=True)
                 self.vad = None
                 return
             # 9-05 她实测"句首时而吞字"：预滚（开口前0.9s）必须喂给 silero，
             # 否则起音在实时流开始前就丢了——句首补料
-            if preroll:
+            if self.vad is not None and preroll:
                 _vad_feed(self, bytes(preroll))
         else:
             self.vad = None
@@ -690,7 +733,8 @@ async def _finish_turn(ws, call: Call) -> None:
 
 def _vad_feed(call: Call, pcm: bytes) -> None:
     """喂 VAD 窗口；段闭合即创建后台转写任务。同步轻量（Silero ~0.001 实时率）。
-    在 WS 接收循环里跑，不阻塞收流。"""
+    在 WS 接收循环里跑，不阻塞收流。跨消息残余样本缓冲（闻序 9-06 P1：
+    不足一窗口的尾部此前被直接丢弃）。"""
     if not ASR_CHUNK or call.vad is None:
         return
     import array
@@ -700,15 +744,22 @@ def _vad_feed(call: Call, pcm: bytes) -> None:
     min_sil = call.vad.min_silence_duration_samples()
     min_sp = call.vad.min_speech_duration_samples()
     max_sp = int(SAMPLE_RATE * VAD_MAX_SEGMENT_S)
-    for pos in range(0, len(samples) - win + 1, win):
-        window = samples[pos:pos + win]
-        hot = call.vad.is_speech(window)
+
+    stream = call.vad_pending + samples.tolist()   # 拼上上一块凑不齐窗口的残余
+    call.vad_pending = stream[-(len(stream) % win):] if len(stream) % win else []
+
+    def _norm(window):                              # silero 要 [-1,1] 浮点（闻序 9-06 P1）
+        return [s / 32768.0 for s in window]
+
+    for pos in range(0, len(stream) - win + 1, win):
+        raw = stream[pos:pos + win]
+        hot = call.vad.is_speech(_norm(raw))
         if hot and not call.vad_cur:
             # 起音时刻：快照此前 0.4s 原始音频垫进段头——silero 刚 reset 判定偏晚时，
             # 起音真音频照样进识别料（9-05 她实测开口吞字案）
             call.vad_seg_ctx = list(call.vad_tail)
         if hot:
-            call.vad_cur.extend(window)
+            call.vad_cur.extend(raw)
             call.vad_speech_win += win
             call.vad_silence_win = 0
             if call.vad_speech_win >= max_sp:          # 单段硬上限强切
@@ -716,66 +767,101 @@ def _vad_feed(call: Call, pcm: bytes) -> None:
                 call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
         else:
             if call.vad_cur:
-                call.vad_cur.extend(window)
+                call.vad_cur.extend(raw)
                 call.vad_silence_win += win
                 if call.vad_silence_win >= min_sil:    # 静音过阈：段闭合
                     if call.vad_speech_win >= min_sp:
                         _schedule_segment(call, call.vad_cur[:len(call.vad_cur) - call.vad_silence_win],
                                           ctx=call.vad_seg_ctx)
                     call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
-        call.vad_tail.extend(window)                    # 滚动音频尾（含静音窗）
+        call.vad_tail.extend(raw)                       # 滚动音频尾（含静音窗）
         if len(call.vad_tail) > VAD_CTX_SAMPLES:
             del call.vad_tail[:len(call.vad_tail) - VAD_CTX_SAMPLES]
 
 
+def _register_task(call: Call, coro) -> asyncio.Task | None:
+    """统一任务工厂：closing 后拒绝新任务；全部任务进 all_tasks 集合，
+    挂断/断线的 finally 统一收割（闻序 9-06 P0：引用清了任务不能丢）。"""
+    if call.closing:
+        return None
+    task = asyncio.create_task(coro)
+
+    def _done(t):
+        call.all_tasks.discard(t)
+    task.add_done_callback(_done)
+    call.all_tasks.add(task)
+    return task
+
+
 def _schedule_segment(call: Call, samples_list: list, ctx: list | None = None) -> None:
     """闭合段 → 后台转写任务（结果挂在任务上，speech_end 时统一收割拼接）。
-    ctx：起音前上下文（垫段头，防起音漏判吞字）。"""
+    ctx：起音前上下文（垫段头，防起音漏判吞字）。
+    任务结果为 (ok, text) 元组——失败段与空段必须区分（闻序 9-06 P1：
+    失败段当空串拼进转写 = 把残缺当完整）。"""
     import array
     merged = list(ctx) if ctx else []
     merged.extend(samples_list)
     pcm = array.array("h", merged).tobytes()
 
-    async def _run() -> str:
+    async def _run():
         try:
             t0 = time.time()
             text = await asyncio.to_thread(_transcribe_local, pcm)
             print(f"[asr-vad] segment {len(pcm) // 32}ms -> {time.time() - t0:.2f}s: {text!r}", flush=True)
-            return text
+            return (True, text.strip())
         except Exception as e:
             print(f"[asr-vad] segment transcribe failed: {e}", flush=True)
-            return ""
+            return (False, "")
 
-    call.seg_tasks.append(asyncio.create_task(_run()))
+    task = _register_task(call, _run())
+    if task is not None:
+        call.seg_tasks.append(task)
 
 
-async def _flush_vad_transcript(call: Call) -> str:
-    """speech_end 收尾：未闭合的尾段直接成段 → 等全部段转写（总超时30s）→ 拼接。
-    返回空串 = 切段无产出，调用方回落整段识别。"""
-    if not ASR_CHUNK or call.vad is None:
-        return ""
-    # 尾段兜底（9-05 她实测吞尾句案）：只要还有残余音频就识别一次，
-    # 生死交给幻听过滤——silero 把轻尾音判成静音时，这里就是最后一道救回的机会。
-    # 但要攒够 0.8s 音频才送：阈值降到 0.3 后呼吸会攒进 vad_cur，过短的送识别
-    # 就是给 SenseVoice 的气流幻觉（幽灵"okay"）开闸——真尾句 1.5s 左右不受影响
-    if call.vad_cur and len(call.vad_cur) >= int(SAMPLE_RATE * 0.8):
-        _schedule_segment(call, call.vad_cur, ctx=call.vad_seg_ctx)
-    call.vad_cur, call.vad_speech_win, call.vad_silence_win = [], 0, 0
-    call.vad_tail, call.vad_seg_ctx = [], []
-    tasks = list(call.seg_tasks)
-    call.seg_tasks = []
+async def _collect_vad(pending: dict) -> str | None:
+    """收割已封存的段任务（闻序 9-06 P0：收割必须在后台轮次任务里做，
+    不能 await 在接收循环里堵 interrupt/hangup）。pending 为 speech_end 时
+    同步封存的 {tasks, vad_cur, seg_ctx} 快照——begin_turn 已把 Call 状态换新。
+    返回拼接转写；存在失败段 → 返回 None（调用方回落整段识别，
+    不能把残缺当完整句）。"""
+    tasks = pending["tasks"]
+    if pending["vad_cur"] and len(pending["vad_cur"]) >= int(SAMPLE_RATE * 0.8):
+        # 尾段兜底：残余够 0.8s 就补成段（呼吸短尾不送——幽灵 okay 闸门）
+        import array
+        pcm = array.array("h", pending["vad_cur"]).tobytes()
+
+        async def _tail():
+            try:
+                t0 = time.time()
+                text = await asyncio.to_thread(_transcribe_local, pcm)
+                print(f"[asr-vad] segment(tail) {len(pcm) // 32}ms -> {time.time() - t0:.2f}s: {text!r}", flush=True)
+                return (True, text.strip())
+            except Exception as e:
+                print(f"[asr-vad] tail transcribe failed: {e}", flush=True)
+                return (False, "")
+        task = asyncio.create_task(_tail())
+        pending["tasks"] = tasks = tasks + [task]
     if not tasks:
         return ""
     try:
         await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=30)
     except asyncio.TimeoutError:
-        print("[asr-vad] segment gather timeout, using partial results", flush=True)
-    texts = []
+        print("[asr-vad] segment gather timeout", flush=True)
+        return None   # 超时=有段没结果，不能拿残缺当完整 → 整轮回落
+    texts, any_failed = [], False
     for t in tasks:
-        if t.done() and not t.cancelled() and not isinstance(t.result(), BaseException):
-            r = t.result()
-            if r and not _is_hallucination(r):
-                texts.append(r.strip())
+        if t.cancelled() or isinstance(t.result(), BaseException):
+            any_failed = True
+            continue
+        ok, text = t.result()
+        if not ok:
+            any_failed = True
+            continue
+        if text and not _is_hallucination(text):
+            texts.append(text)
+    if any_failed:
+        print(f"[asr-vad] {sum(1 for t in tasks if t.done() and not t.cancelled() and not isinstance(t.result(), BaseException) and not t.result()[0])} failed segment(s) -> whole-turn fallback", flush=True)
+        return None
     transcript = " ".join(texts).strip()
     print(f"[asr-vad] turn joined: {len(texts)}/{len(tasks)} segment(s), {len(transcript)} chars", flush=True)
     return transcript
@@ -783,19 +869,22 @@ async def _flush_vad_transcript(call: Call) -> str:
 
 async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                       supplied_text: str = "", prev_generation: asyncio.Task | None = None,
-                      vad_transcript: str = "") -> None:
+                      vad_pending: dict | None = None, vad_end_at: float = 0.0) -> None:
     if not pcm and not supplied_text:
         await send(ws, {"type": "nothing_heard"})
         return
     turn_id = uuid.uuid4().hex
     call.turn_seq += 1                     # M1.5：接收本轮时生成（与 generation_id 分开，不混用）
     turn_seq = call.turn_seq
-    vad_end_at = time.time()               # 自适应停句触发点（闻序分阶段指标）
-    metrics: dict = {"vad_end_at": vad_end_at}
+    # 真实停句时刻由 session 在 speech_end 到达时传入（闻序 9-06 P2：
+    # 旧值在本函数开头才取，把分段收割的等待全算进了"识别耗时"）
+    metrics: dict = {"vad_end_at": vad_end_at or time.time()}
     call.set_state(CallState.K_THINKING)
     await send(ws, {"type": "state", "mode": "thinking"})
     try:
-        # 转写三级优先：打字 > VAD 切段拼接（段级幻听已滤） > 整段识别
+        # 转写三级优先：打字 > VAD 切段拼接（后台收割，闻序 9-06 P0：不占接收循环）> 整段识别。
+        # 有失败段时 _collect_vad 返回 None → 回落整段识别（残缺不能当完整句）
+        vad_transcript = await _collect_vad(vad_pending) if vad_pending else ""
         transcript = supplied_text or vad_transcript or await transcribe(http, pcm)
         metrics["asr_done_at"] = time.time()
         if not transcript:
@@ -813,6 +902,9 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
         # prev_generation 由 session 显式传入（创建时刻的旧任务），不会误伤自己。
         if prev_generation is not None and not prev_generation.done():
             prev_generation.cancel()
+        # 被顶替的旧任务从会话集合里自然脱落（done_callback），
+        # 但 cancel 后的收割由 finally 的 all_tasks 大扫除兜底（闻序 9-06 P0：
+        # 顶替轮识别为空早退时，prev 不经此处直接漏到挂断——all_tasks 是最后防线）。
         # 自然挂断第一步（COVE §16）：这一轮是不是告别？反例保护优先（"别挂"含"挂"字）。
         call.farewell = bool(FAREWELL_RE.search(transcript)) and not FAREWELL_NEG_RE.search(transcript)
         # 先存事实（内存归档缓冲 + 顺序队列落盘），再通知可能已离线的前端（闻序遗漏二）
@@ -827,12 +919,10 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
         if streamed:
             # V2 流式（COVE §12）：SSE 增量 → 按行切句 → 每段立刻清洗/合成/下发。
             # 首句 4~14 字（K 措辞协议）最先出声，不再等网关全量+整段 TTS。
-            # 代价：assistant 轮的存档从"先存后发"变为"流完再存"——SSE 期间被 cancel
-            # （打断/挂断）则该轮 reply 不入档，与 M1.5-3"被顶轮生成即止"语义一致。
+            # 打断时的部分存档见下方 try/except（闻序 9-06 P1：已播几句被打断，
+            # 整轮 assistant 记录不能丢）。
             seg_parts: list[str] = []
             seg_first_done = False
-            tts_fail_streak = 0        # TTS 熔断器（9-05 她 401 风暴案：每段空转 1.5~2s 拖死整轮）
-            tts_muted_until = 0.0
 
             def _is_cjk_line(text: str) -> bool:
                 """去标点空白后含中文且非点缀（CJK≥2 字且占比≥1/3）→ 中文行。
@@ -846,7 +936,7 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                 return cjk >= 2 and cjk * 3 >= len(s)
 
             async def _emit_segment(line: str) -> None:
-                nonlocal seg_first_done, tts_fail_streak, tts_muted_until
+                nonlocal seg_first_done
                 seg_parts.append(line)
                 if generation != call.generation:
                     return  # 已被顶替/打断：字幕音频都不再出（文本照攒，方便日志排查）
@@ -864,34 +954,36 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
                                     "turn_id": turn_id, "text": caption})
                 if not spoken or skip_tts:
                     return
-                if time.time() < tts_muted_until:
-                    return  # 熔断中：字幕照常，TTS 跳过不空转
-                seg_metrics = None
-                if not seg_first_done:   # 延迟指标只看首段（后续段不覆盖 *_at）
+                if time.time() < _tts_breaker["cooldown_until"]:
+                    return  # 主赛道熔断中：字幕照常，TTS 由备胎/跳过（闻序 9-06 P1：跨轮记忆）
+                seg_metrics = metrics if not seg_first_done else None
+                try:
+                    audio = await synthesize(http, spoken, seg_metrics, raw_line=line)
+                except Exception as e:
+                    print(f"[tts-seg] failed: {e}", flush=True)  # 单段失败跳过（熔断计数在 synthesize 内）
+                    return
+                if not seg_first_done:   # 闻序 9-06 P2：首段时刻记"合成成功"而非"开始尝试"
                     seg_first_done = True
                     metrics["first_segment_at"] = time.time()
-                    seg_metrics = metrics
-                try:
-                    audio = await synthesize(http, spoken, seg_metrics)
-                    tts_fail_streak = 0
-                except Exception as e:
-                    tts_fail_streak += 1
-                    if tts_fail_streak >= 3:
-                        tts_muted_until = time.time() + 90   # 连续3败→熔断90s，电话继续（字幕在）
-                        tts_fail_streak = 0
-                        print(f"[tts-seg] circuit OPEN 90s after 3 fails; last: {e}", flush=True)
-                    else:
-                        print(f"[tts-seg] failed: {e}", flush=True)  # 单段失败跳过，后续段继续
-                    return
                 if audio and generation == call.generation:
                     call.set_state(CallState.K_SPEAKING)
                     await send(ws, {"type": "audio", "generation_id": generation,
                                     "data": base64.b64encode(audio).decode("ascii")})
                     await send(ws, {"type": "audio_sentence_end", "generation_id": generation})
 
-            reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
-                                               "transcript": transcript}, metrics,
-                                        on_segment=_emit_segment)
+            try:
+                reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
+                                                   "transcript": transcript}, metrics,
+                                            on_segment=_emit_segment)
+            except asyncio.CancelledError:
+                # 闻序 9-06 P1：已播几句后被打断，整轮 assistant 记录不能丢——
+                # 已生成部分先存档再传播取消
+                partial = "".join(seg_parts).strip()
+                if partial:
+                    call.turns.append(("他", partial + "…"))
+                    call.writer.submit(turn_seq, turn_id + "p", "assistant", partial + "…")
+                    print(f"[stream] cancelled mid-turn, archived partial ({len(partial)} chars)", flush=True)
+                raise
         else:
             reply = await request_reply(http, {"call_session_id": call.id, "turn_id": turn_id,
                                                "transcript": transcript}, metrics)
@@ -913,7 +1005,11 @@ async def answer_turn(ws, call: Call, http: aiohttp.ClientSession, pcm: bytes,
             metrics["tts_stream_first_ok"] = seg_first_done  # 首段是否出过声（纯观测）
         await send(ws, {"type": "generation_end", "generation_id": generation})
         if call.farewell:
-            # 告别回复已下发：告诉前端"道别中"，播完排空后由 graceful_hangup 收线
+            # 告别回复已下发：告诉前端"道别中"，播完排空后由 graceful_hangup 收线。
+            # 闻序 9-06 P1：清旧排空信号必须在这里（告别 generation 明确后）而不是
+            # 武装时——否则告别音频播得快时，有效信号会被武装误清，只能干等硬截止
+            call.playback_idle_at = 0.0
+            call.farewell_gen = generation
             metrics["farewell"] = True
             await send(ws, {"type": "hangup_soon", "grace_ms": HANGUP_GRACE_MS})
         await _finish_turn(ws, call)
@@ -999,6 +1095,8 @@ async def session(ws) -> None:
                         call.hangup_task.cancel()
                     call.hangup_task = None
                     call.farewell = False
+                    call.farewell_gen = 0
+                    call.playback_idle_at = 0.0
                     preroll = b""
                     p64 = event.get("preroll")   # M1.5-4：客户端预滚缓冲（开口前 ~900ms），防 VAD 确认延迟吞句首
                     if p64:
@@ -1025,25 +1123,37 @@ async def session(ws) -> None:
                             call.set_state(CallState.LISTENING)
                             await send(ws, {"type": "state", "mode": "listening"})
                             continue
+                    # 真实停句时刻（闻序 9-06 P2：旧值在分段收割后才记，漏掉等待时间）
+                    vad_end_at = time.time()
+                    # 同步封存本轮 VAD 段状态（闻序 9-06 P0：接收循环绝不 await 收割——
+                    # 期间 interrupt/hangup/新语音全堵。收割挪进 answer_turn 后台任务）
+                    vad_pending = {"tasks": call.seg_tasks[:],
+                                   "vad_cur": call.vad_cur[:],
+                                   "seg_ctx": call.vad_seg_ctx[:]} if kind == "speech_end" else None
+                    call.seg_tasks, call.vad_cur, call.vad_seg_ctx = [], [], []
                     # M1.5-3 核心：生成任务后台化，接收循环不再被 ASR/网关/TTS 阻塞。
                     # 顶替不在这里做——此刻还不知道新轮有没有真话，answer_turn 在内容确认后才掐旧轮。
-                    vad_transcript = await _flush_vad_transcript(call) if kind == "speech_end" else ""
                     prev_task = call.pending_generation
-                    pending_generation = asyncio.create_task(
-                        answer_turn(ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else "",
-                                    prev_generation=prev_task if isinstance(prev_task, asyncio.Task) else None,
-                                    vad_transcript=vad_transcript))
+                    pending_generation = _register_task(call, answer_turn(
+                        ws, call, http, pcm, str(event.get("text", "")) if kind == "text" else "",
+                        prev_generation=prev_task if isinstance(prev_task, asyncio.Task) else None,
+                        vad_pending=vad_pending, vad_end_at=vad_end_at))
+                    if pending_generation is None:   # closing 中：不应发生，防御
+                        continue
                     call.pending_generation = pending_generation  # 同步赋值，先于新任务首次调度
 
                     def _arm_farewell(task: asyncio.Task) -> None:
                         """告别轮正常落幕后才武装收线（answer_turn 吞异常，cancelled 除外）。
                         她中途再开口会在 speech_start 复位 farewell，回调到时自然哑火。"""
                         if call.farewell and not task.cancelled() and (call.hangup_task is None or call.hangup_task.done()):
-                            call.playback_idle_at = 0.0  # 旧轮的排空信号作废——必须等告别回复自己播完
                             call.hangup_task = asyncio.create_task(graceful_hangup(ws, call))
                     pending_generation.add_done_callback(_arm_farewell)
                 elif kind == "playback_idle":
-                    call.playback_idle_at = time.time()   # 前端播放排空：自然挂断等的就是这个地面信号
+                    # 按 generation 校验（闻序 9-06 P1：段间空隙的 idle 不代表整轮播完，
+                    # 旧 generation 的 idle 更不能给告别轮当信号）
+                    gen = event.get("generation_id")
+                    if call.farewell and call.farewell_gen and gen == call.farewell_gen:
+                        call.playback_idle_at = time.time()
                 elif kind == "interrupt":
                     if call.hangup_task and not call.hangup_task.done():
                         call.hangup_task.cancel()      # 打断告别轮 = 告别作废
@@ -1061,6 +1171,7 @@ async def session(ws) -> None:
             # 统一出口（在 ClientSession 关闭前）：收割生成任务 → 排空顺序队列 → 归档。
             # 覆盖三种离开方式：正常 hangup / keepalive 异常断开 / 处理异常——一套时序不再漂移
             call.set_state(CallState.ENDING)
+            call.closing = True   # 闻序 9-06 P0：先禁止新任务，再统一收割
             if pending_generation:
                 pending_generation.cancel()  # 任务可能正拿着 http——必须先收割，不允许活过 ClientSession
                 try:
@@ -1071,6 +1182,16 @@ async def session(ws) -> None:
                 call.hangup_task.cancel()    # 自然挂断任务拿着 ws，同理必须收割在 ClientSession 之前
                 try:
                     await asyncio.wait({call.hangup_task}, timeout=1)
+                except Exception:
+                    pass
+            # 会话级任务大扫除（闻序 9-06 P0：pending_generation 只是最新任务，
+            # 被顶替的旧轮/在途 VAD 段任务都要收——否则活过 ClientSession 碰已关闭资源）
+            stragglers = {t for t in call.all_tasks if not t.done()}
+            for t in stragglers:
+                t.cancel()
+            if stragglers:
+                try:
+                    await asyncio.wait(stragglers, timeout=5)
                 except Exception:
                     pass
             await call.writer.close(timeout=8)
@@ -1124,6 +1245,16 @@ async def main() -> None:
             return Response(500, "ERR", Headers([
                 ("content-type", "text/plain; charset=utf-8"),
             ]), traceback.format_exc().encode())
+
+    # VAD 模型启动预热（闻序 9-06 P1：speech_start → begin_turn 同步下载 2.3MB
+    # 会阻塞整个事件循环 300s 级——必须在启动时后台完成）。
+    # 模型没就绪时 begin_turn 走整段回落，宁可慢不可堵。
+    async def _warm_vad():
+        try:
+            await asyncio.to_thread(_get_vad_model)
+        except Exception as e:
+            print(f"[asr-vad] warmup failed (切段将整轮回落): {e}", flush=True)
+    asyncio.create_task(_warm_vad())
 
     async with serve(session, HOST, PORT, max_size=None, process_request=process_request,
                      ping_interval=25, ping_timeout=120):  # 手机+VPN 链路抖动大，放宽保活判定

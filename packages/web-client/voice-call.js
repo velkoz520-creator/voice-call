@@ -82,6 +82,7 @@ export class VoiceCall {
     this._lastVoiceAt = 0; this._micHinted = false;    // 麦克风健康观察（误触静音检测）
     this.generationId = null;
     this._queue = []; this._pending = new Map(); this._sources = []; this._playhead = 0;
+    this._playGen = 0;   // 播放取消序号：每次 stop/hangup 递增，在途解码完成对不上即弃（闻序 9-06 P1 #11）
     this.video = null; this._frameTimer = null; this.canvas = null;
     this.callSessionId = null; this.stats = { turns: 0, firstAudioMs: null };
     this._turnSentAt = 0;
@@ -161,7 +162,10 @@ export class VoiceCall {
   // ------------------------------------------------------------ 听（Listen 轨 + VAD）
   _onCapture({ pcm, rms }) {
     if (pcm) {
-      this._pushPreroll(pcm);                                           // 预滚缓冲常转（M1.5-4）
+      // worklet 传来的是 ArrayBuffer（transfer 后），统一转 Int16Array——
+      // 闻序 9-06 P1：此前直接 push ArrayBuffer，.length=undefined → 预滚恒为空串
+      const samples = (pcm instanceof Int16Array) ? pcm : new Int16Array(pcm);
+      this._pushPreroll(samples);                                       // 预滚缓冲常转（M1.5-4）
       if (this.ws && this.ws.readyState === 1) this.ws.send(pcm);       // 二进制 PCM16 照常流式上传
     }
     if (rms === undefined) return;
@@ -238,8 +242,8 @@ export class VoiceCall {
   }
 
   // ------------------------------------------------------------ 预滚（M1.5-4）
-  _pushPreroll(pcm) {
-    this._preroll.push(pcm); this._prerollLen += pcm.length;
+  _pushPreroll(samples) {
+    this._preroll.push(samples); this._prerollLen += samples.length;
     const cap = 15 * 1024;                     // 15 块 × 1024 样本 @16k ≈ 960ms
     while (this._prerollLen > cap && this._preroll.length > 1) {
       this._prerollLen -= this._preroll[0].length;
@@ -341,10 +345,12 @@ export class VoiceCall {
   }
 
   async _decodeAndQueue(dataOrB64, genId, isAck) {
+    const myGen = this._playGen;   // 闻序 P1 #11：解码是异步的，打断后旧解码完成不得重新入队
     let buf = dataOrB64;
     if (typeof dataOrB64 === 'string') buf = Uint8Array.from(atob(dataOrB64), (c) => c.charCodeAt(0)).buffer;
     let audio;
     try { audio = await this.ctx.decodeAudioData(buf.slice(0)); } catch (e) { console.warn('解码失败', e); return; }
+    if (myGen !== this._playGen) return;   // 解码期间被打断/挂断：丢弃
     if (!isAck && genId !== this.generationId) return;
     this._queue.push({ audio, genId, isAck });
     this._drain();
@@ -364,7 +370,7 @@ export class VoiceCall {
         this._sources = this._sources.filter((s) => s !== src);
         if (!this._sources.length) {
           this.playing = false; this.emit('playing', false);
-          this._send({ type: 'playback_idle' });   // 播放排空信号：自然挂断（COVE §16）等的就是这个
+          this._send({ type: 'playback_idle', generation_id: this.generationId });   // 闻序 P1：带 generation 防段间空隙误判
           if (this.mode === 'speaking') this._setMode('listening');
         }
       };
@@ -378,6 +384,7 @@ export class VoiceCall {
   }
 
   _stopPlayback() {
+    this._playGen++;   // 使在途 decodeAudioData 全部作废
     for (const s of this._sources) { try { s.onended = null; s.stop(); } catch { /* ignore */ } }
     this._sources = []; this._queue = []; this._pending.clear();
     this._playhead = 0;
